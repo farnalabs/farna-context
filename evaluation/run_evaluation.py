@@ -106,6 +106,7 @@ class ExecutionResult:
     setup_ok: bool
     harness_ok: bool
     guard_error: str | None
+    launch_manifest: dict[str, Any]
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -368,11 +369,50 @@ def _isolated_environment(root: Path) -> dict[str, str]:
             "XDG_CACHE_HOME": str(cache),
             "XDG_DATA_HOME": str(data),
             "OPENCODE_CONFIG_DIR": str(config / "opencode"),
-            "OPENCODE_DISABLE_PROJECT_CONFIG": "0",
+            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
     return environment
+
+
+def _validate_project_argument(checkout: Path, project: Path) -> str | None:
+    checkout_resolved = checkout.resolve()
+    if project.is_symlink():
+        return "project_argument_symlink"
+    try:
+        project_resolved = project.resolve(strict=True)
+    except OSError:
+        return "project_argument_unresolvable"
+    try:
+        project_resolved.relative_to(checkout_resolved)
+    except ValueError:
+        return "project_argument_outside_checkout"
+    return None
+
+
+def _launch_manifest(
+    *, command: list[str], environment: dict[str, str], executable_version: str
+) -> dict[str, Any]:
+    project_argument = command[1] if len(command) > 1 else None
+    normalized_command = [
+        "<executable>"
+        if index == 0
+        else ("<checkout>" if index == 1 and project_argument else value)
+        for index, value in enumerate(command)
+    ]
+    return {
+        "argv": normalized_command,
+        "cwd": "<checkout>",
+        "project_argument": "<checkout>" if project_argument else None,
+        "project_argument_is_explicit": bool(project_argument),
+        "environment": {
+            "OPENCODE_DISABLE_PROJECT_CONFIG": environment.get("OPENCODE_DISABLE_PROJECT_CONFIG"),
+            "OPENCODE_CONFIG_DIR": "<checkout>/config/opencode",
+            "FARNA_CONTEXT_EVALUATION_CHECKOUT": "<checkout>",
+        },
+        "executable_version": executable_version,
+    }
 
 
 def _prompt_for(arm: str, task: bytes, pack_path: Path | None, checkout: Path) -> bytes:
@@ -481,6 +521,32 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
             setup_ok=False,
             harness_ok=True,
             guard_error="checkout_snapshot_unstable",
+            launch_manifest={},
+        )
+    project_argument = Path(command[1]) if len(command) > 1 else Path()
+    project_error = _validate_project_argument(checkout, project_argument)
+    if project_error:
+        return ExecutionResult(
+            process_status="setup_error",
+            returncode=None,
+            stdout_summary="",
+            stderr_summary="",
+            elapsed_seconds=0.0,
+            provider_ok=False,
+            provider_failure_class=None,
+            oracle_passed=None,
+            oracle_summary="not_run:setup_invalidity",
+            changed_files=[],
+            scope_ok=False,
+            test_deletion_ok=False,
+            secret_output_ok=True,
+            contamination_ok=True,
+            contamination_evidence={"error": project_error},
+            prompt_sha256="",
+            setup_ok=False,
+            harness_ok=True,
+            guard_error=project_error,
+            launch_manifest={"project_argument": str(project_argument), "error": project_error},
         )
     parent_root = parent_repository_root()
     parent_before = _parent_evidence(parent_root) if parent_root else {"accessible": False}
@@ -491,6 +557,12 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
     environment["OPENCODE_PROJECT_DIR"] = str(checkout)
     environment["FARNA_CONTEXT_EVALUATION_CHECKOUT"] = str(checkout)
     command = [*command]
+    executable_version = command_version(command[0])
+    launch_manifest = _launch_manifest(
+        command=command,
+        environment=environment,
+        executable_version=executable_version,
+    )
     started = time.monotonic()
     output = b""
     error = b""
@@ -548,6 +620,7 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
         "checkout_changed_files": changed,
         "checkout_root": str(checkout),
     }
+    launch_manifest["project_argument_validation"] = "passed"
 
     oracle_passed: bool | None = None
     oracle_summary = "not_run:provider_failure"
@@ -575,6 +648,7 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
         setup_ok=setup_ok,
         harness_ok=harness_ok,
         guard_error=guard_error,
+        launch_manifest=launch_manifest,
     )
 
 
@@ -680,6 +754,7 @@ def build_record(  # noqa: PLR0913
             "guard_error": execution.guard_error if execution else None,
             "stdout_summary": execution.stdout_summary if execution else "",
             "stderr_summary": execution.stderr_summary if execution else "",
+            "launch_manifest": execution.launch_manifest if execution else {},
         },
         "secondary_metrics": {
             "task_completion_status": "completed"
@@ -750,7 +825,8 @@ def run_evaluation(  # noqa: PLR0913
             if arm == "B":
                 pack_path = checkout / ".evaluation-pack"
                 pack_hash, post_pack_hash = materialise_pack(checkout, pack_path)
-            command = [executable, "run", "--auto", "--format", "json"]
+            command = [executable, str(checkout), "run", "--auto", "--format", "json"]
+
             if model != "UNSPECIFIED":
                 command.extend(["--model", model])
             execution = (
