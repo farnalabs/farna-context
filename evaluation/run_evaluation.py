@@ -32,6 +32,7 @@ _OUTPUT_LIMIT = 8000
 _ALLOWED_CHANGED_FILES = {"src/slugify.py", "tests/test_slugify.py"}
 _IGNORED_TREE_PARTS = {
     ".git",
+    ".agents",
     ".farna-context",
     ".mypy_cache",
     ".pytest_cache",
@@ -60,6 +61,7 @@ _IGNORED_TREE_NAMES = {
     "context-pack.json",
 }
 _MAX_SNAPSHOT_ERRORS = 20
+_PARENT_SENTINEL_VERSION = "parent-sentinel-v1"
 
 
 @dataclass(frozen=True)
@@ -177,29 +179,6 @@ def file_hashes(root: Path) -> dict[str, str]:
     return snapshot.hashes
 
 
-def _strict_snapshot(root: Path) -> TreeSnapshot:
-    hashes: dict[str, str] = {}
-    errors: list[str] = []
-    for directory, _, file_names in os.walk(root, followlinks=False):
-        directory_path = Path(directory)
-        for name in file_names:
-            path = directory_path / name
-            relative_name = path.relative_to(root).as_posix()
-            try:
-                if path.is_symlink():
-                    hashes[relative_name] = sha256_bytes(path.readlink().as_posix().encode())
-                else:
-                    hashes[relative_name] = sha256_file(path)
-            except (OSError, ValueError) as exc:
-                if len(errors) < _MAX_SNAPSHOT_ERRORS:
-                    errors.append(f"{relative_name}:{type(exc).__name__}")
-        for path in directory_path.iterdir():
-            if path.is_symlink() and path.is_dir():
-                relative_name = path.relative_to(root).as_posix()
-                hashes[relative_name] = sha256_bytes(path.readlink().as_posix().encode())
-    return TreeSnapshot(hashes=hashes, errors=tuple(errors))
-
-
 def _snapshot_digest(snapshot: TreeSnapshot) -> str:
     digest = hashlib.sha256()
     for relative_name, file_hash in sorted(snapshot.hashes.items()):
@@ -210,18 +189,70 @@ def _snapshot_digest(snapshot: TreeSnapshot) -> str:
     return digest.hexdigest()
 
 
+def _git_output(root: Path, *arguments: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout
+
+
+def _parent_sentinel_snapshot(root: Path) -> tuple[TreeSnapshot, str]:
+    """Hash parent product files without traversing evaluation worktrees/caches.
+
+    Git supplies the bounded candidate set: tracked files plus ordinary untracked
+    files. The status digest catches deletions and metadata changes; file hashes
+    catch in-place edits that status alone cannot distinguish. Non-git roots use
+    the same explicit transient-directory exclusions as a test-only fallback.
+    """
+    errors: list[str] = []
+    hashes: dict[str, str] = {}
+    try:
+        status = _git_output(root, "status", "--short", "--untracked-files=all")
+        candidates = _git_output(
+            root, "ls-files", "--cached", "--others", "--exclude-standard"
+        ).splitlines()
+        candidate_paths = [
+            root / relative for relative in candidates if not _is_ignored_relative(Path(relative))
+        ]
+    except (OSError, subprocess.CalledProcessError):
+        status = ""
+        candidate_paths = _tracked_tree_paths(root)
+    for path in sorted(candidate_paths):
+        relative_name = path.relative_to(root).as_posix()
+        try:
+            if path.is_symlink():
+                hashes[relative_name] = sha256_bytes(path.readlink().as_posix().encode())
+            elif path.is_file():
+                hashes[relative_name] = sha256_file(path)
+        except (OSError, ValueError) as exc:
+            if len(errors) < _MAX_SNAPSHOT_ERRORS:
+                errors.append(f"{relative_name}:{type(exc).__name__}")
+    status_hash = sha256_bytes(status.encode())
+    return TreeSnapshot(hashes=hashes, errors=tuple(errors)), status_hash
+
+
 def _parent_evidence(root: Path) -> dict[str, Any]:
-    snapshot = _strict_snapshot(root)
+    snapshot, status_hash = _parent_sentinel_snapshot(root)
     evidence: dict[str, Any] = {
         "path": str(root),
         "accessible": not snapshot.errors,
         "tree_hash": None,
+        "sentinel_version": _PARENT_SENTINEL_VERSION,
+        "status_sha256": status_hash,
+        "file_count": len(snapshot.hashes),
+        "excluded_tree_parts": sorted(_IGNORED_TREE_PARTS),
+        "excluded_tree_names": sorted(_IGNORED_TREE_NAMES),
     }
     if snapshot.errors:
         evidence["error"] = "unstable_snapshot"
         evidence["unstable_paths"] = list(snapshot.errors)
     else:
-        evidence["tree_hash"] = _snapshot_digest(snapshot)
+        digest = hashlib.sha256(status_hash.encode())
+        digest.update(_snapshot_digest(snapshot).encode())
+        evidence["tree_hash"] = digest.hexdigest()
     return evidence
 
 
@@ -614,7 +645,7 @@ def build_record(  # noqa: PLR0913
         "model_version": model,
         "tool_versions": {
             "python": sys.version.split()[0],
-            "opencode": command_version(executable),
+            "opencode": "not_run" if dry_run else command_version(executable),
         },
         "permission_policy": protocol["isolation"]["permission_policy"],
         "network_policy": protocol["isolation"]["network_policy"],

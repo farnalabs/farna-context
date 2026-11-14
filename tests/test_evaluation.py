@@ -71,13 +71,18 @@ def test_classification_prioritises_contamination() -> None:
 
 
 def test_dry_run_writes_five_counterbalanced_records_per_arm(tmp_path: Path) -> None:
+    executable = tmp_path / "must-not-run"
+    executable.write_text(
+        f"#!{sys.executable}\n{(tmp_path / 'invoked').as_posix()}\n", encoding="utf-8"
+    )
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
     results_path, summary_path = run_evaluation(
         fixture=synthetic_fixture(),
         output_dir=tmp_path,
         repetitions=EXPECTED_REPETITIONS,
         dry_run=True,
         model="UNSPECIFIED",
-        executable="opencode",
+        executable=str(executable),
     )
     records = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines()]
     expected_records = 10
@@ -93,6 +98,8 @@ def test_dry_run_writes_five_counterbalanced_records_per_arm(tmp_path: Path) -> 
     assert all(record["assignment"]["seed"] == EXPECTED_ASSIGNMENT_SEED for record in records)
     assert all(record["contamination_check"]["status"] == "passed" for record in records)
     assert all(record["guardrails"]["status"] == "not_run" for record in records)
+    assert all(record["tool_versions"]["opencode"] == "not_run" for record in records)
+    assert not (tmp_path / "invoked").exists()
     assert all(record["arm"] == "A" or record["pre_pack_sha256"] for record in records)
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["records"] == expected_records
@@ -189,6 +196,21 @@ while cache_file.exists():
     assert len(records) == EXPECTED_EXECUTION_RECORDS
     assert summary["records"] == EXPECTED_EXECUTION_RECORDS
     assert all("validity" in record for record in records)
+
+
+def test_parent_sentinel_excludes_nested_worktrees_and_hashes_product_files(tmp_path: Path) -> None:
+    parent = tmp_path / "parent"
+    (parent / "src").mkdir(parents=True)
+    (parent / "src" / "slugify.py").write_text("original", encoding="utf-8")
+    (parent / ".agents" / "worktrees" / "deep" / "nested").mkdir(parents=True)
+    (parent / ".agents" / "worktrees" / "deep" / "nested" / "large.bin").write_bytes(b"x" * 1000)
+    before = evaluation_runner._parent_evidence(parent)
+    assert before["file_count"] == 1
+    assert before["sentinel_version"] == "parent-sentinel-v1"
+    assert ".agents" in before["excluded_tree_parts"]
+    (parent / "src" / "slugify.py").write_text("changed", encoding="utf-8")
+    after = evaluation_runner._parent_evidence(parent)
+    assert before["tree_hash"] != after["tree_hash"]
 
 
 def test_fake_process_cannot_contaminate_parent_checkout(tmp_path: Path, monkeypatch) -> None:
