@@ -44,12 +44,14 @@ def materialise_files(
     result = MaterialiseResult()
     prepare_output_directory(output_dir)
 
-    all_files = (
-        list(audit.instruction_files)
-        + list(audit.explicit_files)
-        + list(audit.skills_files)
-        + list(audit.scoped_files)
-    )
+    all_files = [source.path for source in audit.sources if source.included]
+    if not audit.sources:
+        all_files = (
+            list(audit.instruction_files)
+            + list(audit.explicit_files)
+            + list(audit.skills_files)
+            + list(audit.scoped_files)
+        )
 
     for file_path in all_files:
         try:

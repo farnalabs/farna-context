@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import stat
 import sys
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ from .authority import SourceRecord as AuthoritySourceRecord
 from .authority import resolve_authority
 from .config import LocalConfig, load_config
 from .git import check_dirty_tree, get_revision
+from .utils import reject_reparse_components
 
 # Type alias for source classification
 SourceClass = Literal["instruction", "explicit", "skills", "scoped"]
@@ -290,13 +292,21 @@ def read_source_content(source_path: Path) -> tuple[bytes | None, str | None]:
     error: str | None = None
     content: bytes | None = None
 
-    if not source_path.exists():
+    try:
+        reject_reparse_components(source_path)
+    except ValueError:
+        error = f"Unsafe source path: {source_path}"
+
+    if error is None and not source_path.exists():
         error = f"File not found: {source_path}"
-    elif not source_path.is_file():
+    elif error is None and not source_path.is_file():
         error = f"Not a file: {source_path}"
-    else:
+    elif error is None:
         try:
-            content = source_path.read_bytes()
+            if not stat.S_ISREG(source_path.stat().st_mode):
+                error = f"Not a regular file: {source_path}"
+            else:
+                content = source_path.read_bytes()
         except PermissionError:
             error = f"Permission denied: {source_path}"
         except OSError as e:
