@@ -5,6 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 VALID_OUTCOMES = {"success", "failure", "provider_failure", "unobserved", "not_run"}
+DECISION_THRESHOLDS = {
+    "absolute_correctness_difference_points": 20,
+    "maximum_overhead_ratio": 2.0,
+    "minimum_valid_runs_per_arm": 4,
+    "maximum_invalidity_asymmetry": 0.10,
+}
 
 
 def score_task(*, outcome: str, rubric_frozen: bool, checks: dict[str, bool]) -> dict[str, Any]:
@@ -13,9 +19,9 @@ def score_task(*, outcome: str, rubric_frozen: bool, checks: dict[str, bool]) ->
         raise ValueError("unsupported outcome")  # noqa: TRY003
     if not rubric_frozen:
         return {"status": "unfrozen", "value": None, "checks": {}}
-    if outcome != "success":
+    if outcome not in {"success", "failure"}:
         return {"status": "not_scored", "value": None, "checks": checks}
-    passed = all(checks.values())
+    passed = outcome == "success" and all(checks.values())
     return {"status": "scored", "value": 1 if passed else 0, "checks": checks}
 
 

@@ -6,27 +6,53 @@ import sys
 from pathlib import Path
 
 from evaluation.run_evaluation import load_protocol, run_evaluation, synthetic_fixture
-from evaluation.scoring import classify_attempt, score_task
+from evaluation.scoring import DECISION_THRESHOLDS, classify_attempt, score_task
 
 ROOT = Path(__file__).resolve().parents[1]
+EXPECTED_TASK_HASH = "bb6900332ee84e9330e5f2c91658b40cce35710b37dc1295768bf94934387c26"
+EXPECTED_FIXTURE_TREE_HASH = "1b5c29a6c8be7e41a724b657c2944d58a356dae6dd5b5b0fbb3740cc3ac9fcb7"
+EXPECTED_REPETITIONS = 5
+EXPECTED_ASSIGNMENT_SEED = 20261114
+EXPECTED_INVALIDITY_ASYMMETRY = 0.10
+EXPECTED_THRESHOLD_POINTS = 20
+EXPECTED_OVERHEAD_RATIO = 2.0
+EXPECTED_MINIMUM_VALID_RUNS = 4
 
 
-def test_protocol_has_required_boundaries() -> None:
+def test_protocol_has_required_boundaries_and_thresholds() -> None:
     protocol = load_protocol()
-    assert protocol["arms"]["A"]["additional_materialisation"] is False
-    assert protocol["arms"]["B"]["additional_materialisation"] is True
-    assert protocol["isolation"]["cross_arm_outputs_allowed"] is False
-    assert protocol["runner"]["stdin"] == (
-        "always closed with subprocess.DEVNULL unless an explicit prompt file redirect is used"
+    assert protocol["protocol_version"] == "0.2.0"
+    assert protocol["frozen_inputs"]["fixture"] == "synthetic"
+    assert protocol["frozen_inputs"]["fixture_tree_sha256"] == EXPECTED_FIXTURE_TREE_HASH
+    assert protocol["frozen_inputs"]["task_input_sha256"] == EXPECTED_TASK_HASH
+    assert protocol["frozen_inputs"]["task_bytes"]
+    assert protocol["arms"]["A"]["generated_pack"] is False
+    assert protocol["arms"]["B"]["generated_pack"] is True
+    assert protocol["arms"]["B"]["materialisation_boundary"]
+    assert protocol["assignment"]["repetitions_per_arm"] == EXPECTED_REPETITIONS
+    assert protocol["isolation"]["fresh_cache_per_attempt"] is True
+    assert protocol["validity"]["asymmetric_invalidity_limit"] == EXPECTED_INVALIDITY_ASYMMETRY
+    thresholds = protocol["exploratory_decision_thresholds"]
+    assert thresholds["absolute_correctness_difference_points"] == EXPECTED_THRESHOLD_POINTS
+    assert thresholds["maximum_overhead_ratio"] == EXPECTED_OVERHEAD_RATIO
+    assert thresholds["minimum_valid_runs_per_arm"] == EXPECTED_MINIMUM_VALID_RUNS
+    assert thresholds["thresholds_are_product_guarantees"] is False
+    assert protocol["causal_interpretation"].startswith("Do not claim")
+    assert protocol["runner"]["stdin"].startswith("always closed")
+    assert (
+        DECISION_THRESHOLDS["absolute_correctness_difference_points"] == EXPECTED_THRESHOLD_POINTS
     )
     required = set(protocol["required_record_fields"])
     assert {"experiment_id", "arm", "validity", "contamination_check"}.issubset(required)
 
 
-def test_scoring_stays_unfrozen() -> None:
+def test_scoring_stays_frozen_and_valid_failures_are_scored() -> None:
     result = score_task(outcome="success", rubric_frozen=False, checks={"tests": True})
     assert result["status"] == "unfrozen"
     assert result["value"] is None
+    failure = score_task(outcome="failure", rubric_frozen=True, checks={"tests": False})
+    assert failure["status"] == "scored"
+    assert failure["value"] == 0
 
 
 def test_classification_prioritises_contamination() -> None:
@@ -40,24 +66,37 @@ def test_classification_prioritises_contamination() -> None:
     assert result == "contamination_invalidity"
 
 
-def test_dry_run_writes_two_arms_and_summary(tmp_path: Path) -> None:
+def test_dry_run_writes_five_counterbalanced_records_per_arm(tmp_path: Path) -> None:
     results_path, summary_path = run_evaluation(
         fixture=synthetic_fixture(),
         output_dir=tmp_path,
-        repetitions=2,
+        repetitions=EXPECTED_REPETITIONS,
         dry_run=True,
         model="UNSPECIFIED",
         executable="opencode",
     )
     records = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines()]
-    expected_records = 4
+    expected_records = 10
     assert len(records) == expected_records
     assert {record["arm"] for record in records} == {"A", "B"}
     assert all(record["outcome_status"] == "not_run" for record in records)
-    assert all(record["scores"]["status"] == "unfrozen" for record in records)
+    assert all(record["scores"]["status"] == "not_scored" for record in records)
+    assert all(record["input_hashes"]["task_sha256"] == EXPECTED_TASK_HASH for record in records)
+    assert all(
+        record["input_hashes"]["fixture_tree_sha256"] == EXPECTED_FIXTURE_TREE_HASH
+        for record in records
+    )
+    assert all(record["assignment"]["seed"] == EXPECTED_ASSIGNMENT_SEED for record in records)
+    assert all(record["contamination_check"]["status"] == "passed" for record in records)
+    assert all(record["guardrails"]["status"] == "not_run" for record in records)
+    assert all(record["arm"] == "A" or record["pre_pack_sha256"] for record in records)
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["records"] == expected_records
     assert summary["dry_run"] is True
+    assert (
+        summary["thresholds"]["absolute_correctness_difference_points"] == EXPECTED_THRESHOLD_POINTS
+    )
+    assert summary["validity_counts"]["unobserved"] == expected_records
 
 
 def test_cli_dry_run_emits_json_paths(tmp_path: Path) -> None:
@@ -68,8 +107,6 @@ def test_cli_dry_run_emits_json_paths(tmp_path: Path) -> None:
             "--fixture",
             "synthetic",
             "--dry-run",
-            "--repetitions",
-            "1",
             "--output-dir",
             str(tmp_path),
         ],
