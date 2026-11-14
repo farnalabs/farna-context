@@ -58,5 +58,14 @@ Thumbs.db
 TRACKER.md
 .agents/
 
+# Generated POC outputs (keep .farna-context/config.json trackable)
+.farna-context/audit.json
+.farna-context/manifest.json
+.farna-context/pack.json
+.farna-context/receipt.json
+.farna-context/materialisation.json
+.farna-context/verification.json
+.farna-context/materialised/
+
 # Logs
 *.log
