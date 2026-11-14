@@ -1,61 +1,111 @@
 {
-  "protocol_version": "0.1.0",
-  "status": "exploratory",
-  "purpose": "Compare incumbent repository-native guidance with the same guidance plus a Farna Context materialisation under controlled, independently observable conditions.",
+  "protocol_version": "0.2.0",
+  "status": "frozen_exploratory",
+  "purpose": "Compare the incumbent repository-native context with the same context plus a Farna Context materialisation under controlled, independently observable conditions.",
+  "generality": "low-generality exploratory evaluation; one synthetic fixture and one bounded task do not support product-wide claims",
   "frozen_inputs": {
-    "repository_revision": "REQUIRED_FOUNDER_FREEZE",
-    "repository_revision_sha256": "REQUIRED_FOUNDER_FREEZE",
-    "task_input_sha256": "REQUIRED_FOUNDER_FREEZE",
-    "protocol_sha256": "COMPUTED_AT_RUN",
-    "fixture_revision": "synthetic fixture files are versioned with this repository"
+    "fixture": "synthetic",
+    "fixture_revision": "791fd209d9267fd1978acc968d7c26b1b9c48fd7",
+    "fixture_tree_sha256": "1b5c29a6c8be7e41a724b657c2944d58a356dae6dd5b5b0fbb3740cc3ac9fcb7",
+    "task_id": "synthetic:slugify",
+    "task_path": "TASK.md",
+    "task_input_sha256": "bb6900332ee84e9330e5f2c91658b40cce35710b37dc1295768bf94934387c26",
+    "task_bytes": "Implement `slugify(value: str) -> str` in `src/slugify.py`.\n\nRequirements:\n- lowercase the input;\n- replace every run of non-alphanumeric characters with one hyphen;\n- remove leading and trailing hyphens;\n- return an empty string for an input with no alphanumeric characters;\n- add or update tests in `tests/test_slugify.py`.\n\nDo not modify files outside `src/slugify.py` and `tests/test_slugify.py`.\n",
+    "protocol_sha256": "COMPUTED_AT_RUN"
   },
   "fixture_options": {
     "synthetic": {
       "repository": "evaluation/fixtures/synthetic-repo",
       "task": "TASK.md",
-      "safe_for_local_execution": true
+      "safe_for_local_execution": true,
+      "frozen": true
     },
     "modulo": {
       "repository": "caller-supplied clean detached checkout only",
       "safe_for_local_execution": false,
-      "status": "optional and not implemented until a clean checkout is supplied"
+      "status": "not part of this frozen experiment"
     }
   },
   "arms": {
     "A": {
       "label": "incumbent",
-      "context_boundary": "The isolated checkout exactly as copied from the frozen fixture/repository revision. OpenCode may see only repository-native files and the task input.",
-      "additional_materialisation": false
+      "context_boundary": "The isolated checkout exactly as copied from the frozen synthetic fixture revision, plus the fixture-native AGENTS.md and normal repository/tool context. No generated pack is present.",
+      "additional_materialisation": false,
+      "generated_pack": false
     },
     "B": {
       "label": "incumbent_plus_farna_context",
-      "context_boundary": "The same isolated checkout and task input as Arm A, plus the generated context-pack.json placed at the recorded pack path.",
-      "additional_materialisation": true
+      "context_boundary": "Identical to Arm A, plus the generated pack materialised at the declared file-emitter boundary recorded by the harness.",
+      "additional_materialisation": true,
+      "generated_pack": true,
+      "materialisation_boundary": "evaluation harness file-emitter destination recorded as post_pack_sha256"
     }
+  },
+  "assignment": {
+    "repetitions_per_arm": 5,
+    "arm_order": "randomized with a recorded seed, or counterbalanced when a deterministic seed is used",
+    "same_task_bytes_each_attempt": true,
+    "no_post_hoc_task_metric_or_threshold_changes": true
   },
   "isolation": {
     "fresh_checkout_per_attempt": true,
     "fresh_opencode_session_per_attempt": true,
-    "fresh_cache_policy": "no shared evaluation cache; model/provider caches are recorded and treated as contamination if shared",
+    "fresh_cache_per_attempt": true,
+    "fresh_cache_policy": "No shared evaluation cache. Model/provider caches are recorded and treated as contamination if shared.",
     "cross_arm_outputs_allowed": false,
     "cross_arm_conversation_state_allowed": false,
     "parent_checkout_mutation_allowed": false,
+    "contamination_check": "Verify the parent checkout, checkout contents, pack destination, session state, and caches are isolated before and after every attempt.",
     "network_policy": "disabled by default; an explicitly enabled provider/network policy must be recorded",
     "permission_policy": "OpenCode runs with the caller-selected permissions; record the exact policy, never infer it"
   },
   "task_and_scoring": {
-    "task_status": "UNFROZEN_PLACEHOLDER",
-    "scoring_status": "UNFROZEN_PLACEHOLDER",
+    "task_status": "frozen",
+    "scoring_status": "frozen",
+    "primary_outcome": "task_acceptance_correctness",
+    "primary_oracle": "Run the fixed command/test oracle after the agent run; acceptance is correct only when the oracle passes and the changed-file scope is safe.",
+    "secondary_outcomes": [
+      "task_completion_status",
+      "changed_file_scope",
+      "preparation_cost",
+      "pack_size",
+      "elapsed_wall_time",
+      "tool_call_count_if_observable"
+    ],
     "task_freeze_required_before_claims": true,
     "score_freeze_required_before_claims": true,
-    "default_repetitions_per_arm_task": 5,
     "generality_claim": "low-generality exploratory result only; one synthetic fixture/task is not a product-wide claim",
     "no_post_hoc_metric_changes": true,
-    "scoring_note": "Until the founder freezes the task rubric, scores are recorded as null with status=unfrozen; no outcome ranking is permitted."
+    "scoring_note": "A valid task failure is retained and scored as a failure. Setup, provider, harness, and contamination failures are retained but excluded from the primary outcome denominator."
   },
+  "guardrails": [
+    "no unsafe or out-of-scope file changes",
+    "no test deletion or disablement",
+    "no secret output",
+    "no protocol violation",
+    "no contamination"
+  ],
+  "validity": {
+    "valid_task_failure_is_scored": true,
+    "invalidity_excluded_from_outcome_denominator": true,
+    "asymmetric_invalidity_limit": 0.10,
+    "asymmetric_invalidity_rule": "Invalidity asymmetry greater than 10 percentage points makes the experiment inconclusive."
+  },
+  "exploratory_decision_thresholds": {
+    "positive_signal": "Continue only if Arm B improves primary correctness by at least 20 percentage points over Arm A across valid runs, has no safety guardrail violation, and median preparation plus execution overhead is no more than 2x Arm A.",
+    "no_signal": "The primary correctness difference is within +/-20 percentage points and there is no guardrail regression.",
+    "negative_signal": "Arm B is at least 20 percentage points worse, or a safety guardrail violation is attributable to pack delivery.",
+    "inconclusive": "Invalidity asymmetry is greater than 10 percentage points, provider failure prevents comparable runs, or either arm has fewer than 4 valid runs.",
+    "absolute_correctness_difference_points": 20,
+    "maximum_overhead_ratio": 2.0,
+    "minimum_valid_runs_per_arm": 4,
+    "thresholds_are_product_guarantees": false,
+    "thresholds_label": "exploratory thresholds, not product guarantees"
+  },
+  "causal_interpretation": "Do not claim that the model consumed the pack unless consumption is independently observed. Otherwise report only the association between arm assignment and outcomes.",
   "run_classification": {
-    "valid_task_failure": "The assigned task was frozen, setup was valid, the provider produced an attempt, contamination checks passed, and the task outcome failed its frozen rubric.",
-    "valid_task_success": "The assigned task was frozen, setup was valid, provider outcome was observed, contamination checks passed, and the task outcome met its frozen rubric.",
+    "valid_task_failure": "The frozen task was attempted, setup was valid, the provider produced an attempt, contamination checks passed, guardrails passed, and the fixed oracle failed.",
+    "valid_task_success": "The frozen task was attempted, setup was valid, provider outcome was observed, contamination checks passed, guardrails passed, and the fixed oracle passed.",
     "setup_invalidity": "Fixture, checkout, protocol, permission, or command setup did not meet the protocol.",
     "harness_invalidity": "The harness could not produce a trustworthy record, including timeout bookkeeping or failed isolation checks.",
     "provider_failure": "OpenCode/provider/model could not produce a usable attempt; this is not a task failure.",
@@ -101,7 +151,8 @@
   "runner": {
     "stdin": "always closed with subprocess.DEVNULL unless an explicit prompt file redirect is used",
     "timeout_seconds": 900,
-    "command": "caller-selected OpenCode executable and arguments; no credentials or model keys are hard-coded",
-    "dry_run": "plans all materialisation, isolation, and command records without invoking OpenCode"
+    "command": "local OpenCode executable and arguments when available; no credentials or model keys are hard-coded",
+    "unavailable_provider_result": "Record provider_failure or unobserved; never invent results.",
+    "dry_run": "Plans all materialisation, isolation, assignment, and command records without invoking OpenCode."
   }
 }
