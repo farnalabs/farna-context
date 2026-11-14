@@ -99,6 +99,7 @@ def test_dry_run_writes_five_counterbalanced_records_per_arm(tmp_path: Path) -> 
     assert all(record["contamination_check"]["status"] == "passed" for record in records)
     assert all(record["guardrails"]["status"] == "not_run" for record in records)
     assert all(record["tool_versions"]["opencode"] == "not_run" for record in records)
+    assert all(record["delivery_evidence"]["launch_manifest"] == {} for record in records)
     assert not (tmp_path / "invoked").exists()
     assert all(record["arm"] == "A" or record["pre_pack_sha256"] for record in records)
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -122,9 +123,14 @@ def test_fake_execution_closes_stdin_scores_oracle_and_isolates_arms(tmp_path: P
         tmp_path,
         """
 import json
+import os
 import sys
 from pathlib import Path
 
+if len(sys.argv) < 3 or Path(sys.argv[1]) != Path.cwd():
+    raise SystemExit('project argument or cwd is not isolated')
+if os.environ.get('OPENCODE_DISABLE_PROJECT_CONFIG') != '1':
+    raise SystemExit('project config was not disabled')
 prompt = sys.stdin.read()
 if not prompt:
     raise SystemExit('prompt missing')
@@ -158,6 +164,17 @@ print(json.dumps({'prompt_sha256': len(prompt)}))
     assert all(record["delivery_evidence"]["oracle_passed"] is True for record in records)
     assert all(record["guardrails"]["status"] == "passed" for record in records)
     assert all(record["delivery_evidence"]["stderr_summary"] == "" for record in records)
+    assert all(
+        record["delivery_evidence"]["launch_manifest"]["argv"][1] == "<checkout>"
+        for record in records
+    )
+    assert all(
+        record["delivery_evidence"]["launch_manifest"]["environment"][
+            "OPENCODE_DISABLE_PROJECT_CONFIG"
+        ]
+        == "1"
+        for record in records
+    )
     assert len({record["prompt_sha256"] for record in records}) == EXPECTED_EXECUTION_RECORDS
     assert (
         json.loads(summary_path.read_text(encoding="utf-8"))["records"]
@@ -235,15 +252,54 @@ Path.cwd().parent.joinpath('parent', 'unexpected.txt').write_text('bad', encodin
         checkout=checkout,
         task=b"work",
         pack_path=None,
-        command=[str(executable), "run"],
+        command=[str(executable), str(checkout), "run"],
         timeout=30,
     )
     assert (checkout / "cwd-marker.txt").read_text(encoding="utf-8") == str(checkout)
     assert result.contamination_ok is False
+    assert result.launch_manifest["argv"][1] == "<checkout>"
+    assert result.launch_manifest["cwd"] == "<checkout>"
+    assert result.launch_manifest["environment"]["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
     assert (
         result.contamination_evidence["parent_before"]["tree_hash"]
         != result.contamination_evidence["parent_after"]["tree_hash"]
     )
+
+
+def test_project_argument_outside_checkout_is_setup_invalidity(tmp_path: Path) -> None:
+    executable = _fake_executable(tmp_path, "raise SystemExit('must not run')")
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    result = evaluation_runner.execute_attempt(
+        arm="A",
+        checkout=checkout,
+        task=b"work",
+        pack_path=None,
+        command=[str(executable), str(tmp_path), "run"],
+        timeout=30,
+    )
+    assert result.setup_ok is False
+    assert result.guard_error == "project_argument_outside_checkout"
+    assert result.process_status == "setup_error"
+
+
+def test_project_argument_symlink_is_setup_invalidity(tmp_path: Path) -> None:
+    executable = _fake_executable(tmp_path, "raise SystemExit('must not run')")
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    project_link = checkout / "project-link"
+    project_link.symlink_to(checkout, target_is_directory=True)
+    result = evaluation_runner.execute_attempt(
+        arm="A",
+        checkout=checkout,
+        task=b"work",
+        pack_path=None,
+        command=[str(executable), str(project_link), "run"],
+        timeout=30,
+    )
+    assert result.setup_ok is False
+    assert result.guard_error == "project_argument_symlink"
+    assert result.process_status == "setup_error"
 
 
 def test_provider_failure_is_recorded_without_fabricated_task_result(tmp_path: Path) -> None:
