@@ -95,9 +95,24 @@ def identity_payload(value: dict[str, Any], hash_field: str) -> dict[str, Any]:
     return {key: item for key, item in value.items() if key != hash_field}
 
 
+def _validate_output_parent(output_path: Path) -> None:
+    """Reject missing or reparse-point parent components without following them."""
+    parent = output_path.parent
+    current = Path(parent.anchor) if parent.anchor else Path()
+    parts = parent.parts[1:] if parent.anchor else parent.parts
+    for component in parts:
+        current /= component
+        if not current.exists():
+            raise ValueError("Unsafe output path")  # noqa: TRY003
+        if _is_reparse_point(current):
+            raise ValueError("Unsafe output path")  # noqa: TRY003
+    if not parent.is_dir():
+        raise ValueError("Unsafe output path")  # noqa: TRY003
+
+
 def atomic_write_bytes(output_path: Path, data: bytes) -> None:
     """Write bytes through an exclusive, durable same-directory temp file."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _validate_output_parent(output_path)
     if _is_reparse_point(output_path):
         raise ValueError("Unsafe output path")  # noqa: TRY003
     temp_path = output_path.with_name(f".{output_path.name}.tmp-{secrets.token_hex(16)}")

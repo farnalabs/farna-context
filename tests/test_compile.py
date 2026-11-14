@@ -177,6 +177,25 @@ def test_input_mutation_is_detected(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     source.write_bytes(original)
 
 
+def test_atomic_write_rejects_symlinked_output_parent(tmp_path: Path) -> None:
+    """A symlinked parent cannot redirect an atomic write outside its destination."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim.txt"
+    victim.write_bytes(b"unchanged")
+    parent = tmp_path / "output"
+    try:
+        parent.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"platform cannot create symlink: {exc}")
+
+    with pytest.raises(ValueError, match="Unsafe output path"):
+        atomic_write_bytes(parent / "child.json", b"new")
+
+    assert victim.read_bytes() == b"unchanged"
+    assert not (outside / "child.json").exists()
+
+
 def test_atomic_write_rejects_preexisting_temp_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
