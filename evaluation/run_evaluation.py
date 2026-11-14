@@ -376,36 +376,47 @@ def _isolated_environment(root: Path) -> dict[str, str]:
     return environment
 
 
-def _validate_project_argument(checkout: Path, project: Path) -> str | None:
+def _validate_directory_argument(checkout: Path, directory: Path) -> str | None:
     checkout_resolved = checkout.resolve()
-    if project.is_symlink():
-        return "project_argument_symlink"
+    if directory.is_symlink():
+        return "directory_argument_symlink"
     try:
-        project_resolved = project.resolve(strict=True)
+        directory_resolved = directory.resolve(strict=True)
     except OSError:
-        return "project_argument_unresolvable"
+        return "directory_argument_unresolvable"
+    if not directory_resolved.is_dir():
+        return "directory_argument_not_directory"
     try:
-        project_resolved.relative_to(checkout_resolved)
+        directory_resolved.relative_to(checkout_resolved)
     except ValueError:
-        return "project_argument_outside_checkout"
+        return "directory_argument_outside_checkout"
     return None
+
+
+def _directory_argument(command: list[str]) -> Path | None:
+    try:
+        option_index = command.index("--dir")
+        return Path(command[option_index + 1])
+    except (ValueError, IndexError):
+        return None
 
 
 def _launch_manifest(
     *, command: list[str], environment: dict[str, str], executable_version: str
 ) -> dict[str, Any]:
-    project_argument = command[1] if len(command) > 1 else None
+    directory_argument = _directory_argument(command)
     normalized_command = [
-        "<executable>"
-        if index == 0
-        else ("<checkout>" if index == 1 and project_argument else value)
-        for index, value in enumerate(command)
+        "<executable>" if index == 0 else value for index, value in enumerate(command)
     ]
+    if directory_argument is not None:
+        directory_index = command.index("--dir") + 1
+        normalized_command[directory_index] = "<checkout>"
     return {
         "argv": normalized_command,
         "cwd": "<checkout>",
-        "project_argument": "<checkout>" if project_argument else None,
-        "project_argument_is_explicit": bool(project_argument),
+        "directory_argument": "<checkout>" if directory_argument else None,
+        "directory_argument_option": "--dir" if directory_argument else None,
+        "directory_argument_is_explicit": directory_argument is not None,
         "environment": {
             "OPENCODE_DISABLE_PROJECT_CONFIG": environment.get("OPENCODE_DISABLE_PROJECT_CONFIG"),
             "OPENCODE_CONFIG_DIR": "<checkout>/config/opencode",
@@ -523,9 +534,13 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
             guard_error="checkout_snapshot_unstable",
             launch_manifest={},
         )
-    project_argument = Path(command[1]) if len(command) > 1 else Path()
-    project_error = _validate_project_argument(checkout, project_argument)
-    if project_error:
+    directory_argument = _directory_argument(command)
+    directory_error = (
+        "directory_argument_missing"
+        if directory_argument is None
+        else _validate_directory_argument(checkout, directory_argument)
+    )
+    if directory_error:
         return ExecutionResult(
             process_status="setup_error",
             returncode=None,
@@ -541,12 +556,16 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
             test_deletion_ok=False,
             secret_output_ok=True,
             contamination_ok=True,
-            contamination_evidence={"error": project_error},
+            contamination_evidence={"error": directory_error},
             prompt_sha256="",
             setup_ok=False,
             harness_ok=True,
-            guard_error=project_error,
-            launch_manifest={"project_argument": str(project_argument), "error": project_error},
+            guard_error=directory_error,
+            launch_manifest={
+                "directory_argument_option": "--dir",
+                "directory_argument": str(directory_argument) if directory_argument else None,
+                "error": directory_error,
+            },
         )
     parent_root = parent_repository_root()
     parent_before = _parent_evidence(parent_root) if parent_root else {"accessible": False}
@@ -620,7 +639,7 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
         "checkout_changed_files": changed,
         "checkout_root": str(checkout),
     }
-    launch_manifest["project_argument_validation"] = "passed"
+    launch_manifest["directory_argument_validation"] = "passed"
 
     oracle_passed: bool | None = None
     oracle_summary = "not_run:provider_failure"
@@ -825,7 +844,7 @@ def run_evaluation(  # noqa: PLR0913
             if arm == "B":
                 pack_path = checkout / ".evaluation-pack"
                 pack_hash, post_pack_hash = materialise_pack(checkout, pack_path)
-            command = [executable, str(checkout), "run", "--auto", "--format", "json"]
+            command = [executable, "run", "--auto", "--format", "json", "--dir", str(checkout)]
 
             if model != "UNSPECIFIED":
                 command.extend(["--model", model])
