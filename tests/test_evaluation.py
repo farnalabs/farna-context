@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -17,6 +19,7 @@ EXPECTED_INVALIDITY_ASYMMETRY = 0.10
 EXPECTED_THRESHOLD_POINTS = 20
 EXPECTED_OVERHEAD_RATIO = 2.0
 EXPECTED_MINIMUM_VALID_RUNS = 4
+EXPECTED_EXECUTION_RECORDS = 2
 
 
 def test_protocol_has_required_boundaries_and_thresholds() -> None:
@@ -99,6 +102,85 @@ def test_dry_run_writes_five_counterbalanced_records_per_arm(tmp_path: Path) -> 
     assert summary["validity_counts"]["unobserved"] == expected_records
 
 
+def _fake_executable(tmp_path: Path, body: str) -> Path:
+    executable = tmp_path / "fake-opencode.py"
+    executable.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    return executable
+
+
+def test_fake_execution_closes_stdin_scores_oracle_and_isolates_arms(tmp_path: Path) -> None:
+    executable = _fake_executable(
+        tmp_path,
+        """
+import json
+import sys
+from pathlib import Path
+
+prompt = sys.stdin.read()
+if not prompt:
+    raise SystemExit('prompt missing')
+Path('src/slugify.py').write_text(
+    'import re\\n\\ndef slugify(value: str) -> str:\\n'
+    '    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")\\n',
+    encoding='utf-8',
+)
+Path('tests/test_slugify.py').write_text(
+    'from src.slugify import slugify\\n\\n'
+    'def test_slugify() -> None:\\n'
+    '    assert slugify("Hello, world!") == "hello-world"\\n'
+    '    assert slugify("---") == ""\\n',
+    encoding='utf-8',
+)
+print(json.dumps({'prompt_sha256': len(prompt)}))
+""",
+    )
+    results_path, summary_path = run_evaluation(
+        fixture=synthetic_fixture(),
+        output_dir=tmp_path / "runs",
+        repetitions=1,
+        dry_run=False,
+        model="UNSPECIFIED",
+        executable=str(executable),
+    )
+    records = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == EXPECTED_EXECUTION_RECORDS
+    assert all(record["validity"] == "valid_task_success" for record in records)
+    assert all(record["outcome_status"] == "success" for record in records)
+    assert all(record["delivery_evidence"]["oracle_passed"] is True for record in records)
+    assert all(record["guardrails"]["status"] == "passed" for record in records)
+    assert all(record["delivery_evidence"]["stderr_summary"] == "" for record in records)
+    assert len({record["prompt_sha256"] for record in records}) == EXPECTED_EXECUTION_RECORDS
+    assert (
+        json.loads(summary_path.read_text(encoding="utf-8"))["records"]
+        == EXPECTED_EXECUTION_RECORDS
+    )
+
+
+def test_provider_failure_is_recorded_without_fabricated_task_result(tmp_path: Path) -> None:
+    executable = _fake_executable(
+        tmp_path,
+        """
+import sys
+sys.stderr.write('provider authentication failed: token=should-not-be-recorded\\n')
+raise SystemExit(17)
+""",
+    )
+    results_path, _ = run_evaluation(
+        fixture=synthetic_fixture(),
+        output_dir=tmp_path / "runs",
+        repetitions=1,
+        dry_run=False,
+        model="UNSPECIFIED",
+        executable=str(executable),
+    )
+    records = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines()]
+    assert all(record["validity"] == "provider_failure" for record in records)
+    assert all(record["outcome_status"] == "provider_failure" for record in records)
+    assert all(record["scores"]["status"] == "not_scored" for record in records)
+    assert all("should-not-be-recorded" not in json.dumps(record) for record in records)
+
+
 def test_cli_dry_run_emits_json_paths(tmp_path: Path) -> None:
     completed = subprocess.run(
         [
@@ -115,6 +197,7 @@ def test_cli_dry_run_emits_json_paths(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
     )
     assert completed.returncode == 0
     output = json.loads(completed.stdout)

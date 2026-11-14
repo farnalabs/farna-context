@@ -1,45 +1,42 @@
 # Controlled OpenCode usefulness evaluation
 
-This harness freezes a low-generality exploratory comparison of two explicitly bounded arms on the committed synthetic fixture:
+This harness compares two explicitly bounded arms on the frozen synthetic fixture:
 
-- **Arm A:** the fixture-native `AGENTS.md` plus normal repository/tool context, with no generated pack.
-- **Arm B:** identical to Arm A, plus generated pack materialisation at the harness file-emitter boundary recorded in each result.
+- **Arm A:** the fixture-native `AGENTS.md` plus the task, with no generated pack.
+- **Arm B:** the same task and isolated checkout, plus the exact generated pack materialisation at the harness file-emitter boundary.
 
-The frozen task is the bounded `slugify` task in `evaluation/fixtures/synthetic-repo/TASK.md`. The protocol records the fixture revision, fixture tree hash, exact task bytes, and task hash. `evaluation/protocol.json` is the protocol source of truth; do not change the task, scoring oracle, metrics, thresholds, or guardrails after runs begin.
+The task and oracle are frozen in `evaluation/protocol.json` and `evaluation/fixtures/synthetic-repo/TASK.md`. The harness does not claim that OpenCode consumed the pack unless that is independently observed.
 
-## Run the dry-run planning pass
-
-From this repository root:
+## Plan without invoking OpenCode
 
 ```bash
 uv run python evaluation/run_evaluation.py --fixture synthetic --dry-run --output-dir /tmp/farna-context-evaluation
 ```
 
-The command emits a JSON object naming `results.jsonl` and `summary.json`. The default is five repetitions per arm, with randomized arm order and a recorded assignment seed. Each JSONL record is immutable evidence for one arm/attempt. Dry-run records satisfy the frozen protocol without invoking OpenCode.
+The default remains five repetitions per arm, ten JSONL records total, with the frozen randomized assignment seed. Dry-run records are planning records and are not task outcomes.
 
-## Frozen execution rules
+## Execute the bounded evaluation
 
-Use one local OpenCode command/model/harness path when it is available. The runner must close stdin, use fresh checkout/session/cache state for every attempt, record the exact permission and network policies, and run the fixed task acceptance oracle after the agent run. If OpenCode/provider execution is unavailable, retain a `provider_failure` or `unobserved` record and never invent a result.
+```bash
+uv run python evaluation/run_evaluation.py \
+  --fixture synthetic \
+  --opencode opencode \
+  --model UNSPECIFIED \
+  --output-dir /tmp/farna-context-evaluation
+```
 
-A valid task failure remains a valid scored failure. Setup, provider, harness, and contamination failures are retained but excluded from the primary outcome denominator. Invalidity asymmetry above 10 percentage points, provider failure preventing comparable runs, or fewer than four valid runs per arm makes the experiment inconclusive.
+`--opencode` is the local OpenCode executable and `--model` is passed through only when it is not `UNSPECIFIED`; no key or credential is embedded in the harness. Each attempt gets a new temporary checkout, prompt file, HOME/XDG config/cache/data directories, and process. The task is supplied through an explicitly opened prompt-file stdin; stdin is never inherited. The runner enforces the protocol timeout (900 seconds by default), runs the fixed pytest oracle after a successful provider process, records changed-file scope, test deletion/disablement, and secret-output guardrails, and stores only bounded redacted output summaries and hashes.
 
-## Outcomes and guardrails
+If the executable, provider, model, or authentication is unavailable, the record is retained as `provider_failure` (or `unobserved` when the state cannot be established). The harness returns a completed JSONL/summary report and never fabricates a task result. Real OpenCode execution is therefore optional for producing a report, but provider failures make the frozen comparison inconclusive under the protocol thresholds.
 
-The primary outcome is task acceptance correctness from the fixed command/test oracle. Secondary outcomes are task completion status, changed-file scope, preparation cost, pack size, elapsed wall time, and tool-call count when observable. Guardrails prohibit unsafe or out-of-scope changes, test deletion/disablement, secret output, protocol violations, and contamination.
+## Frozen interpretation rules
 
-The exploratory decision thresholds are deliberately not product guarantees:
+A valid task failure is retained and scored as a failure. Setup, provider, harness, and contamination failures are retained but excluded from the primary outcome denominator. Invalidity asymmetry above 10 percentage points, provider failure preventing comparable runs, or fewer than four valid runs per arm makes the experiment inconclusive. The exploratory thresholds are not product guarantees.
 
-- Continue/positive signal: Arm B is at least 20 percentage points better than Arm A across valid runs, has no safety guardrail violation, and median preparation plus execution overhead is no more than 2x Arm A.
-- No signal: the difference is within +/-20 points and there is no guardrail regression.
-- Negative signal: Arm B is at least 20 points worse, or pack delivery causes a safety guardrail violation.
-- Inconclusive: invalidity asymmetry is above 10%, provider failure prevents comparable runs, or either arm has fewer than four valid runs.
+Do not claim that the model consumed the generated pack from arm assignment alone. Report only the association between arm assignment and observed outcomes unless pack consumption is independently observed.
 
-Do not claim that OpenCode consumed the pack unless that is independently observed. Otherwise report only the association between arm assignment and outcomes.
+## Evidence and safety
 
-## Evidence fields
+Every record includes protocol/task/fixture hashes, arm and assignment metadata, policy strings, run identity, validity, score, pack hashes, bounded execution evidence, elapsed wall time, changed-file scope, guardrail results, and contamination status. Records never contain full prompts, source contents, environment dumps, credentials, tokens, or raw unbounded stdout/stderr.
 
-Every record includes the experiment and protocol identifiers, frozen task and fixture hashes, arm and assignment metadata, tool/model metadata, policies, run/attempt identity, validity, score object, pack hashes, delivery evidence, preparation/elapsed metrics, contamination check, guardrail status, and the three status enums (`harness_load_status`, `model_use_status`, and `outcome_status`). The summary is derived from JSONL and cannot rewrite past records.
-
-## Fixture boundary
-
-The synthetic fixture is intentionally small: a native guidance file, a bounded task, a target module, and a test file. It is a harness fixture, not evidence that the real Modulo dogfood task generalises. Modulo support is not part of this frozen experiment because it would require a caller-supplied clean detached checkout and must never mutate the parent Modulo checkout.
+The fixture is intentionally small and safe for local execution. Modulo support is not part of this frozen experiment: a real Modulo run would require a caller-supplied clean detached checkout and must never mutate the parent checkout.
