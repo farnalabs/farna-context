@@ -20,6 +20,7 @@ from .secrets import DETECTOR_REGISTRY_VERSION, scan_bytes, validate_detector_na
 from .utils import (
     atomic_write_bytes,
     canonical_json_bytes,
+    reject_reparse_components,
     safe_source_path,
     sha256_bytes,
     validate_relative_path,
@@ -147,7 +148,14 @@ def compile_manifest(  # noqa: PLR0912, PLR0915
     config_data, config_bytes = _load_json(config_path)
     repo_value = manifest["repo_root"]
     assert isinstance(repo_value, str)
-    repo_root = Path(repo_value).resolve(strict=True)
+    repo_root = Path(repo_value)
+    try:
+        reject_reparse_components(repo_root)
+        repo_root = repo_root.resolve(strict=True)
+    except (OSError, ValueError) as exc:
+        raise InvalidManifestError("Unsafe manifest repo_root") from exc  # noqa: TRY003
+    if not repo_root.is_dir():
+        raise InvalidManifestError("Manifest repo_root must be a directory")  # noqa: TRY003
     task_path, patterns = _config_paths(config_data, repo_root)
     task_bytes = task_path.read_bytes() if task_path else b""
     source_snapshots: list[tuple[dict[str, Any], Path, bytes]] = []

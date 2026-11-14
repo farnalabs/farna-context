@@ -244,6 +244,18 @@ def test_atomic_write_rejects_preexisting_temp_symlink(
     assert not output.exists()
 
 
+def test_manifest_repo_root_symlink_is_rejected(tmp_path: Path) -> None:
+    manifest, config, _source = _fixture(tmp_path)
+    target = tmp_path / "repo"
+    linked = tmp_path / "linked-repo"
+    linked.symlink_to(target, target_is_directory=True)
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["repo_root"] = str(linked)
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(InvalidManifestError, match="Unsafe manifest repo_root"):
+        compile_manifest(manifest, tmp_path / "pack.json", config)
+
+
 def test_explicit_config_is_required(tmp_path: Path) -> None:
     manifest, _config, _source = _fixture(tmp_path)
     with pytest.raises(InvalidManifestError, match="Config path is required"):

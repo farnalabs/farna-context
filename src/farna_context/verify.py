@@ -1,160 +1,117 @@
-"""Hash verification for Farna Context."""
+"""Read-only verification for Farna Context materialisations and packs."""
 
-import hashlib
-import zipfile
+from __future__ import annotations
+
+import json
 from pathlib import Path
 from typing import Any
 
-from .audit import AuditResult
-from .compile import compile_context_pack
-from .config import LocalConfig
-from .manifest import Manifest, generate_manifest
+from .exceptions import InvalidManifestError
+from .utils import canonical_json_bytes, sha256_bytes, sha256_file
 
 
 class VerificationResult:
-    """Result of hash verification."""
+    """Result of an integrity verification."""
 
     def __init__(self) -> None:
-        self.verified: bool = False
-        self.mismatches: list[dict[str, Any]] = []
+        self.verified = False
+        self.mismatches: list[dict[str, str]] = []
         self.errors: list[str] = []
 
 
-def compute_hash(file_path: Path, algorithm: str = "sha256") -> str:
-    """Compute hash of a file.
-
-    Args:
-        file_path: Path to file.
-        algorithm: Hash algorithm (sha256, sha512, md5).
-
-    Returns:
-        Hex digest of the hash.
-    """
-    hasher = hashlib.new(algorithm)
-    with file_path.open("rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def verify_manifest(manifest: Manifest, manifest_path: Path) -> VerificationResult:
-    """Verify manifest file matches expected content.
-
-    Args:
-        manifest: Expected manifest.
-        manifest_path: Path to actual manifest file.
-
-    Returns:
-        VerificationResult.
-    """
-    result = VerificationResult()
-
+def _load_json(path: Path) -> dict[str, Any]:
     try:
-        expected_yaml = manifest.to_yaml()
-        actual_yaml = manifest_path.read_text()
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InvalidManifestError("Unable to load verification plan") from exc  # noqa: TRY003
+    if not isinstance(value, dict):
+        raise InvalidManifestError("Verification plan must be a JSON object")  # noqa: TRY003
+    return value
 
-        if expected_yaml == actual_yaml:
-            result.verified = True
+
+def _expected_sources(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    value = plan.get("included_sources")
+    if not isinstance(value, list):
+        considered = plan.get("considered_sources", plan.get("sources", []))
+        if not isinstance(considered, list):
+            considered = []
+        value = [item for item in considered if isinstance(item, dict) and item.get("included")]
+    if not isinstance(value, list):
+        raise InvalidManifestError("Verification plan has no included_sources")  # noqa: TRY003
+    sources: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise InvalidManifestError("Verification plan contains an invalid source")  # noqa: TRY003
+        expected_hash = item.get("emitted_sha256") or item.get("raw_hash")
+        if not isinstance(expected_hash, str):
+            raise InvalidManifestError("Verification plan source has no hash")  # noqa: TRY003
+        sources.append({"path": item["path"], "hash": expected_hash})
+    return sources
+
+
+def _record_mismatch(result: VerificationResult, file: str, expected: str, actual: str) -> None:
+    result.mismatches.append({"file": file, "expected_hash": expected, "actual_hash": actual})
+
+
+def _verify_materialised_directory(
+    plan: dict[str, Any], output_path: Path, result: VerificationResult
+) -> None:
+    for source in _expected_sources(plan):
+        path = output_path / source["path"]
+        if not path.is_file():
+            result.errors.append(f"Expected output not found: {source['path']}")
+            continue
+        actual_hash = sha256_file(path)
+        if actual_hash != source["hash"]:
+            _record_mismatch(result, source["path"], source["hash"], actual_hash)
+
+
+def _verify_pack(plan: dict[str, Any], output_path: Path, result: VerificationResult) -> None:
+    pack = _load_json(output_path)
+    pack_hash = pack.get("pack_hash")
+    if not isinstance(pack_hash, str):
+        result.errors.append("Pack has no pack_hash")
+    else:
+        expected_pack_hash = sha256_bytes(
+            canonical_json_bytes({k: v for k, v in pack.items() if k != "pack_hash"})
+        )
+        if pack_hash != expected_pack_hash:
+            _record_mismatch(result, "pack_hash", expected_pack_hash, pack_hash)
+
+    selected = pack.get("selected_sources")
+    if not isinstance(selected, list):
+        result.errors.append("Pack has no selected_sources")
+        return
+    expected = {source["path"]: source["hash"] for source in _expected_sources(plan)}
+    actual_paths: set[str] = set()
+    for item in selected:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            result.errors.append("Pack contains an invalid selected source")
+            continue
+        path = item["path"]
+        actual_paths.add(path)
+        actual_hash = item.get("emitted_sha256")
+        expected_hash = expected.get(path)
+        if not isinstance(actual_hash, str) or expected_hash is None:
+            result.errors.append(f"Unexpected output source: {path}")
+        elif actual_hash != expected_hash:
+            _record_mismatch(result, path, expected_hash, actual_hash)
+    for path in sorted(set(expected) - actual_paths):
+        result.errors.append(f"Expected output source not found in pack: {path}")
+
+
+def verify_all(plan_path: Path, output_path: Path) -> VerificationResult:
+    """Verify an existing materialisation plan and output without writing files."""
+    result = VerificationResult()
+    try:
+        plan = _load_json(plan_path)
+        if output_path.is_dir():
+            _verify_materialised_directory(plan, output_path, result)
+        elif output_path.is_file():
+            _verify_pack(plan, output_path, result)
         else:
-            result.mismatches.append(
-                {
-                    "file": str(manifest_path),
-                    "expected_hash": hashlib.sha256(expected_yaml.encode()).hexdigest(),
-                    "actual_hash": hashlib.sha256(actual_yaml.encode()).hexdigest(),
-                }
-            )
-    except Exception as e:
-        result.errors.append(f"Failed to verify manifest: {e}")
-
-    return result
-
-
-def verify_context_pack(pack_path: Path, manifest: Manifest) -> VerificationResult:
-    """Verify context pack contents match manifest.
-
-    Args:
-        pack_path: Path to context pack ZIP.
-        manifest: Expected manifest.
-
-    Returns:
-        VerificationResult.
-    """
-    result = VerificationResult()
-
-    try:
-        with zipfile.ZipFile(pack_path, "r") as zf:
-            # Verify manifest in pack
-            try:
-                pack_manifest = zf.read("manifest.yaml").decode("utf-8")
-                expected_manifest = manifest.to_yaml()
-                if pack_manifest != expected_manifest:
-                    result.mismatches.append(
-                        {
-                            "file": "manifest.yaml",
-                            "expected_hash": hashlib.sha256(expected_manifest.encode()).hexdigest(),
-                            "actual_hash": hashlib.sha256(pack_manifest.encode()).hexdigest(),
-                        }
-                    )
-            except KeyError:
-                result.errors.append("manifest.yaml not found in context pack")
-
-            # Verify all source files listed in manifest
-            manifest_data = manifest.to_dict()
-            for rel_file in manifest_data.get("files", []):
-                arcname = f"sources/{rel_file}"
-                try:
-                    pack_content = zf.read(arcname)
-                    source_path = Path(manifest.repo_root) / rel_file
-                    if source_path.exists():
-                        source_content = source_path.read_bytes()
-                        if pack_content != source_content:
-                            result.mismatches.append(
-                                {
-                                    "file": rel_file,
-                                    "expected_hash": hashlib.sha256(source_content).hexdigest(),
-                                    "actual_hash": hashlib.sha256(pack_content).hexdigest(),
-                                }
-                            )
-                    else:
-                        result.errors.append(f"Source file not found: {rel_file}")
-                except KeyError:
-                    result.errors.append(f"File not found in pack: {rel_file}")
-
-        result.verified = len(result.mismatches) == 0 and len(result.errors) == 0
-
-    except Exception as e:
-        result.errors.append(f"Failed to verify context pack: {e}")
-
-    return result
-
-
-def verify_all(
-    config: LocalConfig, audit_result: AuditResult, repo_root: Path, revision: str
-) -> VerificationResult:
-    """Run all verifications.
-
-    Args:
-        config: Local configuration.
-        audit_result: Audit results.
-        repo_root: Repository root path.
-        revision: Git revision.
-
-    Returns:
-        Combined VerificationResult.
-    """
-    manifest = generate_manifest(config, audit_result, repo_root, revision)
-    compile_context_pack(config, audit_result, repo_root, revision)
-
-    # Verify manifest file
-    manifest_path = Path(config.output_files.manifest)
-    result = verify_manifest(manifest, manifest_path)
-
-    # Verify context pack
-    pack_path = Path(config.output_files.context_pack)
-    if pack_path.exists():
-        pack_result = verify_context_pack(pack_path, manifest)
-        result.mismatches.extend(pack_result.mismatches)
-        result.errors.extend(pack_result.errors)
-
-    result.verified = len(result.mismatches) == 0 and len(result.errors) == 0
+            result.errors.append(f"Output path not found: {output_path}")
+    except (OSError, ValueError, InvalidManifestError) as exc:
+        result.errors.append(str(exc))
+    result.verified = not result.mismatches and not result.errors
     return result

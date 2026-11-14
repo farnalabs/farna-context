@@ -1,5 +1,6 @@
 """CLI compile command smoke tests."""
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -21,8 +22,14 @@ def _inputs(tmp_path: Path, source: bytes = b"safe\n") -> tuple[Path, Path, Path
     config = tmp_path / "config.json"
     config.write_text(json.dumps({"repo_root": str(repo)}), encoding="utf-8")
     manifest = tmp_path / "manifest.json"
+    source_hash = hashlib.sha256((repo / "AGENTS.md").read_bytes()).hexdigest()
     manifest.write_text(
-        json.dumps({"repo_root": str(repo), "sources": [{"path": "AGENTS.md", "included": True}]}),
+        json.dumps(
+            {
+                "repo_root": str(repo),
+                "sources": [{"path": "AGENTS.md", "included": True, "raw_hash": source_hash}],
+            }
+        ),
         encoding="utf-8",
     )
     return manifest, config, tmp_path / "pack.json"
@@ -139,6 +146,46 @@ def test_compile_invalid_manifest_returns_two(tmp_path: Path) -> None:
         app, ["compile", "--manifest", str(manifest), "--config", str(config), "--out", str(output)]
     )
     assert result.exit_code == int(ExitCode.INVALID_ARGS)
+
+
+def test_secrets_database_url_fixture_is_expected_finding(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "example.txt").write_text(
+        "postgresql://user:password@localhost/db\n",
+        encoding="utf-8",
+    )
+    git_repo = Repo.init(repo)
+    (repo / ".gitkeep").write_text("fixture", encoding="utf-8")
+    git_repo.index.add([".gitkeep"])
+    git_repo.index.commit("fixture")
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "repo_root": str(repo),
+                "source_scope": {"explicit_instruction_files": ["example.txt"]},
+                "secret_patterns": {"named_detectors": ["database_url"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(app, ["secrets", "--config", str(config)])
+    assert result.exit_code == int(ExitCode.SECRET_DETECTED)
+    assert "database_url" in result.stdout
+    assert "No secrets found" not in result.stdout
+
+
+def test_verify_command_checks_existing_pack_without_recompiling(tmp_path: Path) -> None:
+    manifest, config, output = _inputs(tmp_path)
+    compiled = CliRunner().invoke(
+        app,
+        ["compile", "--manifest", str(manifest), "--config", str(config), "--out", str(output)],
+    )
+    assert compiled.exit_code == 0
+    result = CliRunner().invoke(app, ["verify", "--plan", str(manifest), "--out", str(output)])
+    assert result.exit_code == 0
+    assert "All verifications passed" in result.stdout
 
 
 def test_compile_secret_returns_twelve(tmp_path: Path) -> None:

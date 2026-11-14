@@ -258,26 +258,23 @@ def materialise(
 
 @app.command()
 def verify(
-    config_path: Annotated[
-        Path | None, typer.Option("--config", "-c", help="Path to config file")
-    ] = None,
+    plan: Annotated[
+        Path,
+        typer.Option(
+            "--plan",
+            help="Existing manifest or materialisation plan",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option("--out", "--output", "-o", help="Existing pack or materialisation directory"),
+    ],
 ) -> None:
-    """Verify manifest and context pack integrity."""
+    """Verify an existing materialisation plan and output without writing."""
     try:
-        config, repo_root = _get_config_and_repo(config_path)
-        revision = get_revision(repo_root)
-
-        sources = audit_sources(config, repo_root)
-        audit_context = AuditContext(
-            config=config,
-            repo_root=repo_root,
-            revision=revision,
-            sources=sources,
-            task_brief_hash="",
-            config_hash="",
-        )
-        audit_result = collect_audit_result(audit_context)
-        result = verify_all(config, audit_result, repo_root, revision)
+        result = verify_all(plan, output)
 
         if result.verified:
             console.print("[green]All verifications passed[/green]")

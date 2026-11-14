@@ -43,6 +43,16 @@ def _is_reparse_point(path: Path) -> bool:
     return bool(getattr(info, "st_file_attributes", 0) & reparse_flag)
 
 
+def reject_reparse_components(path: Path) -> None:
+    """Reject symlink or Windows reparse-point components in an existing path."""
+    current = Path(path.anchor) if path.anchor else Path()
+    parts = path.parts[1:] if path.anchor else path.parts
+    for component in parts:
+        current /= component
+        if _is_reparse_point(current):
+            raise ValueError("Unsafe path")  # noqa: TRY003
+
+
 def safe_source_path(repo_root: Path, relative_path: str | Path) -> Path:
     """Resolve a regular source file without following links or leaving the repo."""
     relative = validate_relative_path(relative_path)
