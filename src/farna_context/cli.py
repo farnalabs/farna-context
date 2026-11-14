@@ -1,5 +1,8 @@
 """CLI entry point for Farna Context."""
 
+import hashlib
+import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -17,7 +20,7 @@ from .exceptions import (
     RequiredSourceError,
     SecretDetectedError,
 )
-from .git import GitError, get_repo_root, get_revision
+from .git import GitError, check_dirty_tree, get_repo_root, get_revision
 from .manifest import generate_manifest, run_manifest
 from .materialise import materialise_files, materialise_to_stdout
 from .receipt import generate_receipt
@@ -79,29 +82,90 @@ def _handle_generic_error(e: Exception, exit_code: ExitCode) -> None:
     _exit_with_error(exit_code)
 
 
+def _raise_init_error(message: str) -> None:
+    """Raise a validation error for init inputs."""
+    raise ValueError(message)  # noqa: TRY003
+
+
 @app.command()
-def init(
-    repo_root: Annotated[
-        Path | None, typer.Option("--repo-root", "-r", help="Repository root path")
+def init(  # noqa: PLR0913, PLR0917
+    repo: Annotated[
+        Path | None, typer.Option("--repo", "--repo-root", "-r", help="Repository root path")
     ] = None,
+    config_path: Annotated[
+        Path | None, typer.Option("--config", "-c", help="Config file path")
+    ] = None,
+    task: Annotated[Path | None, typer.Option("--task", help="Task brief file path")] = None,
+    staging_parent: Annotated[
+        Path | None, typer.Option("--staging-parent", help="Staging parent directory")
+    ] = None,
+    out: Annotated[Path | None, typer.Option("--out", help="Init record output path")] = None,
     force: Annotated[bool, typer.Option("--force", "-f", help="Overwrite existing config")] = False,
 ) -> None:
-    """Initialize a new Farna Context configuration."""
-    repo_root = Path.cwd() if repo_root is None else repo_root.resolve()
+    """Initialize Farna Context and write its init record."""
+    try:
+        if repo is None:
+            repo = Path.cwd()
+        repo_root = repo.resolve()
+        if config_path is None:
+            config_path = repo_root / CONFIG_FILE
+        if task is None or staging_parent is None or out is None:
+            if task is None and staging_parent is None and out is None:
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                if config_path.exists() and not force:
+                    console.print(
+                        f"[red]Config already exists at {config_path}. "
+                        "Use --force to overwrite.[/red]"
+                    )
+                    _exit_with_error(ExitCode.CONFIG_ERROR)
+                save_config(LocalConfig(repo_root="."), config_path)
+                console.print(f"[green]Created config at {config_path}[/green]")
+                return
+            _raise_init_error("--task, --staging-parent, and --out must be provided together")
+        assert config_path is not None
+        assert task is not None
+        assert staging_parent is not None
+        assert out is not None
+        config_path = config_path.resolve()
+        task_path = task.resolve()
+        staging_path = staging_parent.resolve()
+        out = out.resolve()
 
-    config_path = repo_root / CONFIG_FILE
+        config = load_config(config_path)
+        configured_repo = config.get_repo_root_path(_config_repo_base(config_path))
+        if configured_repo != repo_root:
+            _raise_init_error(
+                f"Config repo_root {configured_repo} does not match --repo {repo_root}"
+            )
+        if not task_path.is_file():
+            _raise_init_error(f"Task brief not found: {task_path}")
+        staging_path.mkdir(parents=True, exist_ok=True)
 
-    if config_path.exists() and not force:
-        console.print(
-            f"[red]Config already exists at {config_path}. Use --force to overwrite.[/red]"
+        revision = get_revision(repo_root)
+        dirty = bool(check_dirty_tree(repo_root))
+        config_json = json.dumps(
+            config.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
         )
-        _exit_with_error(ExitCode.CONFIG_ERROR)
-
-    config = LocalConfig(repo_root=".")
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    save_config(config, config_path)
-
-    console.print(f"[green]Created config at {config_path}[/green]")
+        config_hash = hashlib.sha256(config_json.encode()).hexdigest()
+        record = {
+            "config_hash": config_hash,
+            "repo_root": str(repo_root),
+            "revision": revision,
+            "task_brief_path": str(task_path),
+            "staging_parent": str(staging_path),
+            "dirty": dirty,
+            "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "schema_version": "1.0",
+        }
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        console.print(f"[green]Init record written to {out}[/green]")
+    except GitError as e:
+        _handle_git_error(e)
+    except typer.Exit:
+        raise
+    except Exception as e:
+        _handle_generic_error(e, ExitCode.CONFIG_ERROR)
 
 
 @app.command()

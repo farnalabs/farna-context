@@ -115,6 +115,47 @@ def test_help_lists_commands() -> None:
     assert "compile" in result.stdout
 
 
+def test_init_accepts_poc_contract_options_and_writes_record(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "AGENTS.md").write_text("instructions\n", encoding="utf-8")
+    git_repo = Repo.init(repo)
+    git_repo.index.add(["AGENTS.md"])
+    git_repo.index.commit("fixture")
+
+    config = repo / ".farna-context" / "config.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({"repo_root": "."}), encoding="utf-8")
+    task = tmp_path / "task.txt"
+    task.write_text("task\n", encoding="utf-8")
+    staging = tmp_path / "context-staging"
+    output = tmp_path / "init.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "init",
+            "--repo",
+            str(repo),
+            "--config",
+            str(config),
+            "--task",
+            str(task),
+            "--staging-parent",
+            str(staging),
+            "--out",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert staging.is_dir()
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["repo_root"] == str(repo.resolve())
+    assert record["revision"] == git_repo.head.commit.hexsha
+    assert record["staging_parent"] == str(staging.resolve())
+
+
 def test_compile_command_writes_pack(tmp_path: Path) -> None:
     manifest, config, output = _inputs(tmp_path)
     result = CliRunner().invoke(
