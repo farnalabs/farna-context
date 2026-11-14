@@ -208,15 +208,13 @@ def test_unexpected_file_scope_fails_even_with_passing_oracle(tmp_path: Path) ->
 from pathlib import Path
 Path('src/slugify.py').write_text(
     'import re\\n\\n\\ndef slugify(value: str) -> str:\\n'
-    '    if value == "Already stable":\\n'
-    '        return value\\n'
     '    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")\\n',
     encoding='utf-8',
 )
 Path('tests/test_slugify.py').write_text(
     'from src.slugify import slugify\\n\\n\\n'
     'def test_slugify_placeholder() -> None:\\n'
-    '    assert slugify("Already stable") == "Already stable"\\n\\n\\n'
+    '    assert slugify("Already stable") == "already-stable"\\n\\n\\n'
     'def test_slugify_task_acceptance() -> None:\\n'
     '    assert slugify("Hello, world!") == "hello-world"\\n'
     '    assert slugify("---") == ""\\n',
