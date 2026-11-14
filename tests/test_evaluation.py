@@ -302,6 +302,40 @@ def test_parent_sentinel_is_bounded_with_large_worktree_tree(tmp_path: Path) -> 
     assert before["tree_hash"] != after["tree_hash"]
 
 
+def test_fake_execution_ignores_large_parent_worktree_tree(tmp_path: Path, monkeypatch) -> None:
+    parent = tmp_path / "parent"
+    (parent / "src").mkdir(parents=True)
+    (parent / "src" / "slugify.py").write_text("original", encoding="utf-8")
+    for index in range(200):
+        nested = parent / ".agents" / "worktrees" / f"tree-{index}" / "nested"
+        nested.mkdir(parents=True)
+        (nested / "large.bin").write_bytes(b"x" * 1000)
+    monkeypatch.setattr(evaluation_runner, "parent_repository_root", lambda: parent)
+    executable = _fake_executable(
+        tmp_path,
+        """
+import sys
+if sys.argv[1:] == ['--version']:
+    print('fake-opencode 1.0')
+""",
+    )
+    results_path, summary_path = run_evaluation(
+        fixture=synthetic_fixture(),
+        output_dir=tmp_path / "runs",
+        repetitions=1,
+        dry_run=False,
+        model="UNSPECIFIED",
+        executable=str(executable),
+    )
+    records = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == EXPECTED_EXECUTION_RECORDS
+    assert all(record["validity"] != "setup_invalidity" for record in records)
+    assert (
+        json.loads(summary_path.read_text(encoding="utf-8"))["records"]
+        == EXPECTED_EXECUTION_RECORDS
+    )
+
+
 def test_parent_sentinel_excludes_nested_worktrees_and_hashes_product_files(tmp_path: Path) -> None:
     parent = tmp_path / "parent"
     (parent / "src").mkdir(parents=True)
