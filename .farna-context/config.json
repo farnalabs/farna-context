@@ -1,0 +1,49 @@
+{
+  "repo_root": ".",
+  "revision": null,
+  "source_scope": {
+    "instruction_files": [
+      "*.md",
+      "docs/**/*.md",
+      "AGENTS.md"
+    ],
+    "explicit_instruction_files": [],
+    "skills_rules_dir": ".agents/skills",
+    "path_scopes": [
+      "src/",
+      "tests/"
+    ],
+    "precedence": [
+      "explicit",
+      "instruction",
+      "skills"
+    ],
+    "required": [
+      "README.md"
+    ]
+  },
+  "harness_fixture": "opencode",
+  "task_brief_path": null,
+  "staging_parent": ".farna-context/staging",
+  "task_overlay": {
+    "task_brief_path": null,
+    "extra_sources": [],
+    "exclude_patterns": []
+  },
+  "output_files": {
+    "manifest": "manifest.yaml",
+    "context_pack": "context_pack.zip",
+    "receipt": "receipt.json"
+  },
+  "secret_patterns": {
+    "patterns": [
+      "(?i)(api[_-]?key|secret|token|password|passwd)\\s*[:=]\\s*['\"]?[a-zA-Z0-9_\\-]{20,}['\"]?",
+      "(?i)(aws[_-]?access[_-]?key|aws[_-]?secret[_-]?key)\\s*[:=]\\s*['\"]?[A-Z0-9]{20,}['\"]?",
+      "-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----",
+      "sk-[a-zA-Z0-9]{32,}",
+      "gh[pousr]_[a-zA-Z0-9]{36,}",
+      "xox[baprs]-[a-zA-Z0-9-]{10,}"
+    ],
+    "exclude_paths": []
+  }
+}
