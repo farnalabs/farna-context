@@ -189,6 +189,35 @@ def test_compile_invalid_manifest_returns_two(tmp_path: Path) -> None:
     assert result.exit_code == int(ExitCode.INVALID_ARGS)
 
 
+def test_secrets_database_url_references_are_safe(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "example.txt").write_text(
+        'os.environ.get("DATABASE_URL")\n'
+        "DATABASE_URL=postgresql+asyncpg://...\n"
+        "DATABASE_URL=${DATABASE_URL} $DATABASE_URL {{ secrets.DATABASE_URL }}\n",
+        encoding="utf-8",
+    )
+    git_repo = Repo.init(repo)
+    (repo / ".gitkeep").write_text("fixture", encoding="utf-8")
+    git_repo.index.add([".gitkeep"])
+    git_repo.index.commit("fixture")
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "repo_root": str(repo),
+                "source_scope": {"explicit_instruction_files": ["example.txt"]},
+                "secret_patterns": {"named_detectors": ["database_url"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(app, ["secrets", "--config", str(config)])
+    assert result.exit_code == 0
+    assert "No secrets found in 1 files" in result.stdout
+
+
 def test_secrets_database_url_fixture_is_expected_finding(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
