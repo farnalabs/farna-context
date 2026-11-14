@@ -30,6 +30,41 @@ DEFAULT_TIMEOUT = 900
 ASSIGNMENT_SEED = 20261114
 _OUTPUT_LIMIT = 8000
 _ALLOWED_CHANGED_FILES = {"src/slugify.py", "tests/test_slugify.py"}
+# These paths are writable by the runner, provider, or test tooling. They are
+# included in checkout snapshots so their mutations are observed, then reported
+# separately from task changes rather than silently widening task scope.
+_RUNTIME_ARTIFACT_PARTS = {
+    ".coverage",
+    ".evaluation-pack",
+    ".evaluation-output",
+    ".evaluation-prompt.md",
+    ".evaluation-runs",
+    ".mypy_cache",
+    ".nox",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "cache",
+    "caches",
+    "config",
+    "data",
+    "dist",
+    "evaluation-pack",
+    "evaluation-output",
+    "evaluation-runs",
+    "htmlcov",
+    "node_modules",
+    "runs",
+    "venv",
+}
+_RUNTIME_ARTIFACT_PREFIXES = (
+    Path("config/opencode"),
+    Path("data/opencode"),
+    Path("home/.npm"),
+)
 _IGNORED_TREE_PARTS = {
     ".git",
     ".agents",
@@ -97,6 +132,7 @@ class ExecutionResult:
     oracle_passed: bool | None
     oracle_summary: str
     changed_files: list[str]
+    runtime_artifacts: list[str]
     scope_ok: bool
     test_deletion_ok: bool
     secret_output_ok: bool
@@ -123,7 +159,14 @@ def _is_ignored_relative(relative: Path) -> bool:
     )
 
 
-def _tracked_tree_paths(root: Path) -> list[Path]:
+def _is_runtime_artifact(relative_name: str) -> bool:
+    relative = Path(relative_name)
+    return any(part in _RUNTIME_ARTIFACT_PARTS for part in relative.parts) or any(
+        relative == prefix or prefix in relative.parents for prefix in _RUNTIME_ARTIFACT_PREFIXES
+    )
+
+
+def _tracked_tree_paths(root: Path, *, include_runtime_artifacts: bool = False) -> list[Path]:
     paths: list[Path] = []
     for directory, directory_names, file_names in os.walk(root, followlinks=False):
         directory_path = Path(directory)
@@ -131,21 +174,34 @@ def _tracked_tree_paths(root: Path) -> list[Path]:
         directory_names[:] = [
             name
             for name in directory_names
-            if not _is_ignored_relative(relative_directory / name)
+            if (
+                not _is_ignored_relative(relative_directory / name)
+                if not include_runtime_artifacts
+                else not any(
+                    part in _IGNORED_TREE_PARTS for part in (relative_directory / name).parts
+                )
+            )
             and not (directory_path / name).is_symlink()
         ]
         for name in file_names:
             path = directory_path / name
             relative = path.relative_to(root)
-            if not _is_ignored_relative(relative) and not path.is_symlink():
+            ignored = (
+                _is_ignored_relative(relative)
+                if not include_runtime_artifacts
+                else any(part in _IGNORED_TREE_PARTS for part in relative.parts)
+            )
+            if not ignored and not path.is_symlink():
                 paths.append(path)
     return paths
 
 
-def _snapshot_tree(root: Path) -> TreeSnapshot:
+def _snapshot_tree(root: Path, *, include_runtime_artifacts: bool = False) -> TreeSnapshot:
     hashes: dict[str, str] = {}
     errors: list[str] = []
-    for path in sorted(_tracked_tree_paths(root)):
+    for path in sorted(
+        _tracked_tree_paths(root, include_runtime_artifacts=include_runtime_artifacts)
+    ):
         relative_name = path.relative_to(root).as_posix()
         try:
             hashes[relative_name] = sha256_file(path)
@@ -174,7 +230,7 @@ def tree_hash(root: Path) -> str:
 
 
 def file_hashes(root: Path) -> dict[str, str]:
-    snapshot = _snapshot_tree(root)
+    snapshot = _snapshot_tree(root, include_runtime_artifacts=True)
     if snapshot.errors:
         raise OSError("unstable file snapshot")  # noqa: TRY003
     return snapshot.hashes
@@ -415,6 +471,7 @@ def _launch_manifest(
         "argv": normalized_command,
         "cwd": "<checkout>",
         "directory_argument": "<checkout>" if directory_argument else None,
+        "runtime_artifact_policy": "runtime artifacts are separated from task changes",
         "directory_argument_option": "--dir" if directory_argument else None,
         "directory_argument_is_explicit": directory_argument is not None,
         "environment": {
@@ -451,15 +508,17 @@ def _changed_files(before: dict[str, str], checkout: Path) -> list[str]:
 
 def _guardrail_results(
     before: dict[str, str], checkout: Path, output: bytes, error: bytes
-) -> tuple[list[str], bool, bool, bool, str | None]:
+) -> tuple[list[str], list[str], bool, bool, bool, str | None]:
     try:
         after = file_hashes(checkout)
     except OSError:
-        return [], False, False, False, "checkout_snapshot_unstable"
+        return [], [], False, False, False, "checkout_snapshot_unstable"
     changed = sorted(
         path for path in set(before) | set(after) if before.get(path) != after.get(path)
     )
-    scope_ok = set(changed).issubset(_ALLOWED_CHANGED_FILES)
+    runtime_artifacts = [path for path in changed if _is_runtime_artifact(path)]
+    task_changes = [path for path in changed if path not in runtime_artifacts]
+    scope_ok = set(task_changes).issubset(_ALLOWED_CHANGED_FILES)
     deletion_ok = all(path in after for path in before if path.startswith("tests/"))
     if deletion_ok:
         for path in sorted(path for path in after if path.startswith("tests/")):
@@ -473,13 +532,13 @@ def _guardrail_results(
     secret_ok = not any(pattern.search(combined) for pattern in _SECRET_PATTERNS.values())
     if secret_ok:
         for path in changed:
-            if any(
-                pattern.search((checkout / path).read_bytes())
-                for pattern in _SECRET_PATTERNS.values()
+            changed_path = checkout / path
+            if changed_path.is_file() and any(
+                pattern.search(changed_path.read_bytes()) for pattern in _SECRET_PATTERNS.values()
             ):
                 secret_ok = False
                 break
-    return changed, scope_ok, deletion_ok, secret_ok, None
+    return task_changes, runtime_artifacts, scope_ok, deletion_ok, secret_ok, None
 
 
 def _run_oracle(checkout: Path, environment: dict[str, str]) -> tuple[bool, str]:
@@ -523,6 +582,7 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
             oracle_passed=None,
             oracle_summary="not_run:setup_invalidity",
             changed_files=[],
+            runtime_artifacts=[],
             scope_ok=False,
             test_deletion_ok=False,
             secret_output_ok=True,
@@ -552,6 +612,7 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
             oracle_passed=None,
             oracle_summary="not_run:setup_invalidity",
             changed_files=[],
+            runtime_artifacts=[],
             scope_ok=False,
             test_deletion_ok=False,
             secret_output_ok=True,
@@ -618,7 +679,7 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
         process_status = "process_error"
         provider_failure_class = type(exc).__name__
     elapsed = time.monotonic() - started
-    changed, scope_ok, deletion_ok, secret_ok, guard_error = _guardrail_results(
+    changed, runtime_artifacts, scope_ok, deletion_ok, secret_ok, guard_error = _guardrail_results(
         before, checkout, output, error
     )
     parent_after = _parent_evidence(parent_root) if parent_root else {"accessible": False}
@@ -636,10 +697,12 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
         "parent_before": parent_before,
         "parent_after": parent_after,
         "checkout_before_tree_sha256": checkout_before_hash,
-        "checkout_changed_files": changed,
+        "checkout_changed_files": sorted(set(changed) | set(runtime_artifacts)),
+        "runtime_artifacts": runtime_artifacts,
         "checkout_root": str(checkout),
     }
     launch_manifest["directory_argument_validation"] = "passed"
+    launch_manifest["runtime_artifacts"] = runtime_artifacts
 
     oracle_passed: bool | None = None
     oracle_summary = "not_run:provider_failure"
@@ -658,6 +721,7 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
         oracle_passed=oracle_passed,
         oracle_summary=oracle_summary,
         changed_files=changed,
+        runtime_artifacts=runtime_artifacts,
         scope_ok=scope_ok,
         test_deletion_ok=deletion_ok,
         secret_output_ok=secret_ok,
@@ -767,6 +831,7 @@ def build_record(  # noqa: PLR0913
             "oracle_passed": execution.oracle_passed if execution else None,
             "oracle_summary": execution.oracle_summary if execution else "not_run",
             "changed_files": execution.changed_files if execution else [],
+            "runtime_artifacts": execution.runtime_artifacts if execution else [],
             "process_status": execution.process_status if execution else "not_run",
             "returncode": execution.returncode if execution else None,
             "provider_failure_class": execution.provider_failure_class if execution else None,
@@ -780,6 +845,7 @@ def build_record(  # noqa: PLR0913
             if execution and execution.provider_ok
             else "not_run",
             "changed_file_scope": execution.scope_ok if execution else "not_observed",
+            "runtime_artifact_count": len(execution.runtime_artifacts) if execution else 0,
             "preparation_cost": None,
             "pack_size_bytes": pack_path.stat().st_size if pack_path else 0,
             "elapsed_wall_time_seconds": execution.elapsed_seconds if execution else None,

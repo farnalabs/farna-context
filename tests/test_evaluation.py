@@ -134,6 +134,14 @@ if os.environ.get('OPENCODE_DISABLE_PROJECT_CONFIG') != '1':
 prompt = sys.stdin.read()
 if not prompt:
     raise SystemExit('prompt missing')
+for runtime_path in (
+    Path('config/opencode/state.json'),
+    Path('data/opencode/run.db'),
+    Path('home/.npm/_cacache/index-v5/entry'),
+    Path('cache/provider.json'),
+):
+    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime_path.write_text('runtime', encoding='utf-8')
 Path('src/slugify.py').write_text(
     'import re\\n\\ndef slugify(value: str) -> str:\\n'
     '    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")\\n',
@@ -162,6 +170,12 @@ print(json.dumps({'prompt_sha256': len(prompt)}))
     assert all(record["validity"] == "valid_task_success" for record in records)
     assert all(record["outcome_status"] == "success" for record in records)
     assert all(record["delivery_evidence"]["oracle_passed"] is True for record in records)
+    assert all(
+        record["delivery_evidence"]["changed_files"] == ["src/slugify.py", "tests/test_slugify.py"]
+        for record in records
+    )
+    assert all(record["delivery_evidence"]["runtime_artifacts"] for record in records)
+    assert all(record["secondary_metrics"]["changed_file_scope"] is True for record in records)
     assert all(record["guardrails"]["status"] == "passed" for record in records)
     assert all(record["delivery_evidence"]["stderr_summary"] == "" for record in records)
     assert all(
@@ -185,6 +199,39 @@ print(json.dumps({'prompt_sha256': len(prompt)}))
         json.loads(summary_path.read_text(encoding="utf-8"))["records"]
         == EXPECTED_EXECUTION_RECORDS
     )
+
+
+def test_unexpected_file_scope_fails_even_with_passing_oracle(tmp_path: Path) -> None:
+    executable = _fake_executable(
+        tmp_path,
+        """
+from pathlib import Path
+Path('src/slugify.py').write_text(
+    'def slugify(value: str) -> str:\\n    return value\\n', encoding='utf-8'
+)
+Path('tests/test_slugify.py').write_text(
+    'def test_slugify() -> None:\\n    assert True\\n', encoding='utf-8'
+)
+Path('unexpected.py').write_text('unexpected', encoding='utf-8')
+""",
+    )
+    results_path, _ = run_evaluation(
+        fixture=synthetic_fixture(),
+        output_dir=tmp_path / "runs",
+        repetitions=1,
+        dry_run=False,
+        model="UNSPECIFIED",
+        executable=str(executable),
+    )
+    records = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines()]
+    assert all(record["delivery_evidence"]["oracle_passed"] is True for record in records)
+    assert all(
+        record["delivery_evidence"]["changed_files"]
+        == ["src/slugify.py", "tests/test_slugify.py", "unexpected.py"]
+        for record in records
+    )
+    assert all(record["secondary_metrics"]["changed_file_scope"] is False for record in records)
+    assert all(record["outcome_status"] == "failure" for record in records)
 
 
 def test_transient_cache_disappearance_returns_records(tmp_path: Path) -> None:
