@@ -88,8 +88,16 @@ def _config_paths(
     task: Path | None = None
     if isinstance(task_path, str):
         try:
-            task = safe_source_path(repo_root, task_path)
-        except ValueError as exc:
+            candidate = Path(task_path)
+            if candidate.is_absolute():
+                task = candidate.resolve(strict=True)
+                if task.is_symlink():
+                    raise InvalidManifestError("Invalid task path")  # noqa: TRY003
+            else:
+                task = safe_source_path(repo_root, task_path)
+            if not task.is_file():
+                raise InvalidManifestError("Invalid task path")  # noqa: TRY003
+        except OSError as exc:
             raise InvalidManifestError("Invalid task path") from exc  # noqa: TRY003
     secret_data = config_data.get("secret_patterns", {})
     if not isinstance(secret_data, dict):

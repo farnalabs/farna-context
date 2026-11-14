@@ -369,7 +369,13 @@ def secrets(
             config_hash="",
         )
         audit_result = collect_audit_result(audit_context)
-        source_bytes = [(str(path), path.read_bytes()) for path in audit_result.instruction_files]
+        source_files = (
+            list(audit_result.instruction_files)
+            + list(audit_result.explicit_files)
+            + list(audit_result.skills_files)
+            + list(audit_result.scoped_files)
+        )
+        source_bytes = [(str(path), path.read_bytes()) for path in source_files]
         result = scan_sources(source_bytes, config.secret_patterns)
 
         if result.has_secrets():

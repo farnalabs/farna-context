@@ -105,13 +105,40 @@ class TestLocalConfig:
         """Test repo root path resolution."""
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
-            # Config file is in repo root
-            config_dir = tmpdir_path
-
-            # Test with current directory
             config = LocalConfig(repo_root=".")
-            resolved = config.get_repo_root_path(config_dir)
+            resolved = config.get_repo_root_path(tmpdir_path)
             assert resolved == tmpdir_path.resolve()
+
+    def test_absolute_operational_paths_are_allowed(self):
+        """Dogfood fixtures may use absolute operational paths."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "repo"
+            repo.mkdir()
+            task = root / "task.txt"
+            task.write_text("task", encoding="utf-8")
+            staging = root / "staging"
+            staging.mkdir()
+            config = LocalConfig(
+                repo_root=str(repo), task_brief_path=str(task), staging_parent=str(staging)
+            )
+            assert config.get_repo_root_path(root) == repo
+            assert config.get_task_brief_path(root) == task
+            assert config.get_staging_path(root) == staging
+
+    def test_operational_symlink_is_rejected(self):
+        """Operational roots must not resolve through symlinks."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / "repo"
+            target.mkdir()
+            link = root / "link"
+            try:
+                link.symlink_to(target, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                pytest.skip(f"platform cannot create symlink: {exc}")
+            with pytest.raises(ValueError, match="Unsafe path"):
+                LocalConfig(repo_root=str(link)).get_repo_root_path(root)
 
     def test_staging_path_resolution(self):
         """Test staging path resolution."""
@@ -127,6 +154,14 @@ class TestLocalConfig:
 
 class TestConfigPersistence:
     """Tests for config load/save."""
+
+    def test_load_committed_fixture_shape(self):
+        """The signed-off fixture shape loads and resolves its operational paths."""
+        fixture = Path(__file__).parents[1] / ".farna-context" / "config.json"
+        loaded = load_config(fixture)
+        assert loaded.repo_root.startswith("/")
+        assert loaded.source_scope.instruction_files == ["AGENTS.md", "CLAUDE.md"]
+        assert loaded.source_scope.skills_rules_dir == "backend/scripts"
 
     def test_save_and_load(self):
         """Test saving and loading config."""

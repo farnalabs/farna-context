@@ -12,7 +12,7 @@ from src.farna_context.exceptions import (
     RequiredSourceError,
     SecretDetectedError,
 )
-from src.farna_context.utils import canonical_json_bytes, sha256_bytes
+from src.farna_context.utils import atomic_write_bytes, canonical_json_bytes, sha256_bytes
 
 
 def _fixture(tmp_path: Path, *, secret: bool = False) -> tuple[Path, Path, Path]:
@@ -175,6 +175,22 @@ def test_input_mutation_is_detected(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     with pytest.raises(InputChangedError):
         compile_manifest(manifest, tmp_path / "pack.json", config)
     source.write_bytes(original)
+
+
+def test_atomic_write_rejects_preexisting_temp_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlink at a candidate temp path cannot overwrite its victim."""
+    output = tmp_path / "pack.json"
+    victim = tmp_path / "victim.txt"
+    victim.write_bytes(b"unchanged")
+    temp = tmp_path / ".pack.json.tmp-fixed"
+    temp.symlink_to(victim)
+    monkeypatch.setattr("src.farna_context.utils.secrets.token_hex", lambda _size: "fixed")
+    with pytest.raises(FileExistsError):
+        atomic_write_bytes(output, b"new")
+    assert victim.read_bytes() == b"unchanged"
+    assert not output.exists()
 
 
 def test_explicit_config_is_required(tmp_path: Path) -> None:

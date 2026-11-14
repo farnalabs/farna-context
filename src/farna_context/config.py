@@ -1,7 +1,9 @@
 """Local Config schema for Farna Context."""
 
 import json
+import stat
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -10,6 +12,56 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 ERR_UNSAFE_PATH = "Unsafe path"
 ERR_UNKNOWN_HARNESS = "Unknown harness fixture"
 DRIVE_LETTER_MIN_LENGTH = 2
+
+
+def _is_safe_operational_path(value: str) -> bool:
+    """Reject device, traversal, ADS, and malformed operational paths."""
+    if not value or "\x00" in value:
+        return False
+    normalised = value.replace("\\", "/")
+    path = Path(normalised)
+    has_drive_prefix = len(normalised) >= DRIVE_LETTER_MIN_LENGTH and normalised[1] == ":"
+    if normalised.startswith("//") or (has_drive_prefix and not path.is_absolute()):
+        return False
+    if any(part == ".." for part in path.parts):
+        return False
+    if any(
+        ":" in part and not (len(part) == DRIVE_LETTER_MIN_LENGTH and part[1] == ":")
+        for part in path.parts
+    ):
+        return False
+    return not any(part.upper() == "NUL" or part.upper().startswith("NUL.") for part in path.parts)
+
+
+def _resolve_operational_path(value: str, base: Path) -> Path:
+    """Resolve an operational path while retaining links for safety checks."""
+    path = Path(value)
+    return path if path.is_absolute() else base / path
+
+
+def _reject_reparse_components(path: Path) -> None:
+    """Reject symlink/reparse components in an operational path."""
+    current = Path(path.anchor) if path.anchor else Path()
+    for component in path.parts if not path.anchor else path.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            raise ValueError(ERR_UNSAFE_PATH)
+
+
+def _require_regular_path(path: Path, *, directory: bool = False) -> Path:
+    """Require a regular existing file or directory, without symlink traversal."""
+    try:
+        _reject_reparse_components(path)
+        if not path.exists():
+            raise ValueError(ERR_UNSAFE_PATH)
+        mode = path.stat().st_mode
+    except OSError as exc:
+        raise ValueError(ERR_UNSAFE_PATH) from exc
+    if directory and not stat.S_ISDIR(mode):
+        raise ValueError(ERR_UNSAFE_PATH)
+    if not directory and not stat.S_ISREG(mode):
+        raise ValueError(ERR_UNSAFE_PATH)
+    return path
 
 
 class SourceScope(BaseModel):
@@ -96,15 +148,20 @@ class TaskOverlay(BaseModel):
         description="Patterns to exclude from source discovery",
     )
 
-    @field_validator("task_brief_path", "extra_sources", "exclude_patterns", mode="before")
+    @field_validator("task_brief_path", mode="before")
     @classmethod
-    def validate_paths(cls, v: list[str] | str | None) -> list[str] | str | None:
-        """Validate that paths are repository-relative and safe."""
-        if v is None:
-            return v
-        paths = [v] if isinstance(v, str) else v
-        for path in paths:
-            if path and not SourceScope._is_safe_path(path):
+    def validate_task_brief_path(cls, v: str | None) -> str | None:
+        """Validate the operational task brief path."""
+        if v is not None and not _is_safe_operational_path(v):
+            raise ValueError(ERR_UNSAFE_PATH)
+        return v
+
+    @field_validator("extra_sources", "exclude_patterns", mode="before")
+    @classmethod
+    def validate_source_paths(cls, v: list[str]) -> list[str]:
+        """Validate repository-relative overlay source paths."""
+        for path in v:
+            if not SourceScope._is_safe_path(path):
                 raise ValueError(ERR_UNSAFE_PATH)
         return v
 
@@ -192,11 +249,11 @@ class LocalConfig(BaseSettings):
 
     @field_validator("repo_root", "staging_parent", "task_brief_path", mode="before")
     @classmethod
-    def validate_repo_paths(cls, v: str | None) -> str | None:
-        """Validate repository-relative paths."""
+    def validate_operational_paths(cls, v: str | None) -> str | None:
+        """Validate designated operational paths, which may be absolute."""
         if v is None:
             return v
-        if not SourceScope._is_safe_path(v):
+        if not isinstance(v, str) or not _is_safe_operational_path(v):
             raise ValueError(ERR_UNSAFE_PATH)
         return v
 
@@ -210,25 +267,53 @@ class LocalConfig(BaseSettings):
         return v
 
     def get_repo_root_path(self, config_dir: Path) -> Path:
-        """Resolve repo_root to an absolute path."""
-        repo_root = Path(self.repo_root)
-        if repo_root.is_absolute():
-            return repo_root.resolve()
-        return (config_dir / repo_root).resolve()
+        """Resolve and validate repo_root as a regular directory."""
+        path = _resolve_operational_path(self.repo_root, config_dir)
+        return _require_regular_path(path, directory=True)
 
     def get_staging_path(self, config_dir: Path) -> Path:
-        """Resolve staging_parent to an absolute path."""
-        staging = Path(self.staging_parent)
-        if staging.is_absolute():
-            return staging.resolve()
-        return (config_dir / staging).resolve()
+        """Resolve staging_parent as a safe directory location."""
+        path = _resolve_operational_path(self.staging_parent, config_dir)
+        _reject_reparse_components(path.parent)
+        path.mkdir(parents=True, exist_ok=True)
+        return _require_regular_path(path, directory=True)
+
+    def get_task_brief_path(self, config_dir: Path) -> Path | None:
+        """Resolve and validate the configured regular task brief, if any."""
+        value = self.task_overlay.task_brief_path or self.task_brief_path
+        if value is None:
+            return None
+        return _require_regular_path(_resolve_operational_path(value, config_dir))
+
+
+def _normalise_fixture_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Adapt the signed-off dogfood fixture shape to the typed config model."""
+    normalised = dict(data)
+    raw_sources = normalised.pop("sources", None)
+    if isinstance(normalised.get("source_scope"), str):
+        normalised.pop("source_scope")
+    if isinstance(raw_sources, dict):
+        normalised["source_scope"] = {
+            "instruction_files": raw_sources.get("instruction_files", []),
+            "explicit_instruction_files": raw_sources.get("explicit_instruction_files", []),
+            "skills_rules_dir": raw_sources.get("skills_rules_dir"),
+            "path_scopes": list(raw_sources.get("path_scopes", {}).keys()),
+            "precedence": list(raw_sources.get("precedence", {}).keys()),
+            "required": list(raw_sources.get("required", {}).keys()),
+        }
+    raw_output = normalised.get("output_files")
+    if isinstance(raw_output, list):
+        normalised["output_files"] = OutputFiles()
+    return normalised
 
 
 def load_config(config_path: Path) -> LocalConfig:
     """Load configuration from a JSON file."""
     with config_path.open() as f:
         data = json.load(f)
-    return LocalConfig(**data)
+    if not isinstance(data, dict):
+        raise TypeError("Config must be a JSON object")  # noqa: TRY003
+    return LocalConfig(**_normalise_fixture_data(data))
 
 
 def save_config(config: LocalConfig, config_path: Path) -> None:

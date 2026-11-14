@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from src.farna_context.cli import app
@@ -22,6 +23,39 @@ def _inputs(tmp_path: Path, source: bytes = b"safe\n") -> tuple[Path, Path, Path
         encoding="utf-8",
     )
     return manifest, config, tmp_path / "pack.json"
+
+
+def test_secrets_scans_non_instruction_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Secrets scans explicit, skills, and scoped source classes too."""
+    repo = tmp_path / "repo"
+    (repo / "skills").mkdir(parents=True)
+    (repo / "scoped").mkdir()
+    (repo / "explicit.txt").write_text("api_key = hidden", encoding="utf-8")
+    (repo / "skills" / "rule.md").write_text("safe", encoding="utf-8")
+    (repo / "scoped" / "source.md").write_text("safe", encoding="utf-8")
+    (repo / ".git").mkdir()
+    monkeypatch.setattr("src.farna_context.cli.get_revision", lambda _root: "test")
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "repo_root": str(repo),
+                "source_scope": {
+                    "explicit_instruction_files": ["explicit.txt"],
+                    "skills_rules_dir": "skills",
+                    "path_scopes": ["scoped"],
+                },
+                "secret_patterns": {"named_detectors": ["api_key"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(app, ["secrets", "--config", str(config)])
+    assert result.exit_code == int(ExitCode.SECRET_DETECTED)
+    assert "api_key" in result.stdout
+    assert "hidden" not in result.stdout
 
 
 def test_compile_command_writes_pack(tmp_path: Path) -> None:

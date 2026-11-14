@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import stat
 from pathlib import Path
 from typing import Any
@@ -31,8 +32,11 @@ def validate_relative_path(value: str | Path) -> str:
 
 
 def _is_reparse_point(path: Path) -> bool:
-    """Return whether a path is a symlink or Windows reparse point."""
-    info = path.lstat()
+    """Return whether an existing path is a symlink or Windows reparse point."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
     if stat.S_ISLNK(info.st_mode):
         return True
     reparse_flag = 0x0400
@@ -92,14 +96,24 @@ def identity_payload(value: dict[str, Any], hash_field: str) -> dict[str, Any]:
 
 
 def atomic_write_bytes(output_path: Path, data: bytes) -> None:
-    """Write bytes through a durable same-directory temporary file and rename."""
+    """Write bytes through an exclusive, durable same-directory temp file."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = output_path.with_name(f".{output_path.name}.tmp-{os.getpid()}")
+    if _is_reparse_point(output_path):
+        raise ValueError("Unsafe output path")  # noqa: TRY003
+    temp_path = output_path.with_name(f".{output_path.name}.tmp-{secrets.token_hex(16)}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    mode = stat.S_IRUSR | stat.S_IWUSR
+    fd = os.open(temp_path, flags, mode)
     try:
-        with temp_path.open("wb") as handle:
+        if _is_reparse_point(temp_path):
+            raise ValueError("Unsafe temporary path")  # noqa: TRY003
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         temp_path.replace(output_path)
     finally:
+        if fd >= 0:
+            os.close(fd)
         temp_path.unlink(missing_ok=True)
