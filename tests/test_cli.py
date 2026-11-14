@@ -280,10 +280,46 @@ def test_clean_fixture_full_sequence_reaches_receipt(
     )
     assert verify_result.exit_code == 0
     assert verification_path.is_file()
-    receipt_result = runner.invoke(app, ["receipt", "--output", str(receipt_path)])
+    init_path = tmp_path / "init.json"
+    init_path.write_text(
+        json.dumps({"revision": git_repo.head.commit.hexsha, "status": "complete"}),
+        encoding="utf-8",
+    )
+    receipt_result = runner.invoke(
+        app,
+        [
+            "receipt",
+            "--init",
+            str(init_path),
+            "--audit",
+            str(audit_path),
+            "--manifest",
+            str(manifest_path),
+            "--pack",
+            str(pack_path),
+            "--materialisation",
+            str(materialisation_path),
+            "--verification",
+            str(verification_path),
+            "--out",
+            str(receipt_path),
+        ],
+    )
 
     assert receipt_result.exit_code == 0
     assert receipt_path.is_file()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["revision"] == git_repo.head.commit.hexsha
+    assert set(receipt["artefacts"]) == {
+        "init",
+        "audit",
+        "manifest",
+        "pack",
+        "materialisation",
+        "verification",
+    }
+    assert receipt["artefacts"]["verification"]["evidence"]["verified"] is True
+    assert "content_base64" not in json.dumps(receipt)
 
 
 def test_verify_command_checks_existing_pack_without_recompiling(tmp_path: Path) -> None:
