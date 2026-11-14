@@ -1,0 +1,8 @@
+{
+  "constraint_id": "slugify.private.unicode",
+  "description": "Preserve Unicode letters when deciding which characters are alphanumeric; do not narrow slugification to ASCII-only input.",
+  "shadow_destination": ".farna-context/shadow/AGENTS.md",
+  "delivery_mode": "native_shadow_file",
+  "scope": "src/slugify.py",
+  "required_probe": "café déjà vu -> café-déjà-vu"
+}

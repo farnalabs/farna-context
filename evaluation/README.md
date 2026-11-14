@@ -1,11 +1,13 @@
 # Controlled OpenCode usefulness evaluation
 
-This harness compares two explicitly bounded arms on the frozen synthetic fixture:
+This harness defines a low-generality experiment around explicit context types and delivery modes:
 
-- **Arm A:** the fixture-native `AGENTS.md` plus the task, with no generated pack.
-- **Arm B:** the same task and isolated checkout, plus the exact generated pack materialisation at the harness file-emitter boundary.
+- **Arm A:** incumbent synthetic repository guidance only.
+- **Arm B:** incumbent guidance plus a native shadow `AGENTS.md` at `.farna-context/shadow/AGENTS.md`, after `git check-ignore` preflight. The shadow carries the private Unicode constraint.
+- **Arm C:** recorded as unsupported/adapter-needed unless native scoped path-glob consumption is observed; it is not run or faked.
+- **Artefact:** future/reference-only; never injected into the prompt automatically.
 
-The task and oracle are frozen in `evaluation/protocol.json` and `evaluation/fixtures/synthetic-repo/TASK.md`. The harness does not claim that OpenCode consumed the pack unless that is independently observed.
+The task and oracle are frozen in `evaluation/protocol.json` and `evaluation/fixtures/synthetic-repo/TASK.md`. Baseline is valid but less safe: it may implement ASCII-only slugification. A successful Arm B outcome must preserve Unicode letters. The harness records context type, delivery mode, destination, ignore evidence and consumption status; it does not infer consumption from assignment.
 
 ## Plan without invoking OpenCode
 
@@ -13,7 +15,7 @@ The task and oracle are frozen in `evaluation/protocol.json` and `evaluation/fix
 uv run python evaluation/run_evaluation.py --fixture synthetic --dry-run --output-dir /tmp/farna-context-evaluation
 ```
 
-The default remains five repetitions per arm, ten JSONL records total, with the frozen randomized assignment seed. Dry-run records are planning records and are not task outcomes.
+The default remains five repetitions per valid arm, ten JSONL records total, with the frozen randomized assignment seed. Dry-run records include exact A/B context-delivery records and never invoke an executable. The ignored shadow file is treated as allowed runtime/context materialisation, recorded separately, and removed only when its hash matches. Dry-run records are planning records and are not task outcomes.
 
 ## Execute the bounded evaluation
 

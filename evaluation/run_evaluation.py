@@ -30,12 +30,19 @@ DEFAULT_TIMEOUT = 900
 ASSIGNMENT_SEED = 20261114
 _OUTPUT_LIMIT = 8000
 _ALLOWED_CHANGED_FILES = {"src/slugify.py", "tests/test_slugify.py"}
+_SHADOW_DESTINATION = Path(".farna-context/shadow/AGENTS.md")
+_PRIVATE_CONSTRAINT = (
+    "For slugify, preserve Unicode letters when deciding alphanumeric characters; "
+    "the probe `café déjà vu` must become `café-déjà-vu`."
+)
+_VALID_ARMS = ("A", "B")
 # These paths are writable by the runner, provider, or test tooling. They are
 # included in checkout snapshots so their mutations are observed, then reported
 # separately from task changes rather than silently widening task scope.
 _RUNTIME_ARTIFACT_PARTS = {
     ".coverage",
     ".evaluation-pack",
+    ".farna-context",
     ".evaluation-output",
     ".evaluation-prompt.md",
     ".evaluation-runs",
@@ -86,6 +93,7 @@ _IGNORED_TREE_PARTS = {
 }
 _IGNORED_TREE_NAMES = {
     ".evaluation-prompt.md",
+    ".farna-context",
     ".evaluation-pack",
     ".evaluation-output",
     ".evaluation-runs",
@@ -344,34 +352,41 @@ def synthetic_fixture() -> Fixture:
 
 def copy_fixture(fixture: Fixture, destination: Path) -> None:
     shutil.copytree(fixture.root, destination, dirs_exist_ok=True)
+    subprocess.run(["git", "-C", str(destination), "init", "-q"], check=True)
 
 
-def materialise_pack(checkout: Path, destination: Path) -> tuple[str, str]:
-    source_paths = [
-        path for path in _tracked_tree_paths(checkout) if destination not in path.parents
-    ]
-    destination.mkdir(parents=True, exist_ok=True)
-    source_hash = tree_hash(checkout)
-    pack = {
-        "pack_version": "evaluation-0.1",
-        "source_tree_sha256": source_hash,
-        "selected_files": [],
-        "evidence_origin": "derived_from_local_fixture",
+def _git_check_ignore(checkout: Path, relative: Path) -> dict[str, Any]:
+    completed = subprocess.run(
+        ["git", "-C", str(checkout), "check-ignore", "-v", "--", relative.as_posix()],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return {
+        "ignored": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "evidence": _bounded_summary(completed.stdout.strip()),
     }
-    for path in sorted(source_paths):
-        relative = path.relative_to(checkout)
-        if relative.parts[0] == ".git":
-            continue
-        target = destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, target)
-        pack["selected_files"].append({"path": relative.as_posix(), "sha256": sha256_file(path)})
-    pack_bytes = json.dumps(pack, sort_keys=True, separators=(",", ":")).encode()
-    pack_hash = sha256_bytes(pack_bytes)
-    pack["pack_sha256"] = pack_hash
-    pack_path = destination / "context-pack.json"
-    pack_path.write_text(json.dumps(pack, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return pack_hash, sha256_file(pack_path)
+
+
+def _shadow_preflight(checkout: Path, destination: Path) -> dict[str, Any]:
+    relative = destination.relative_to(checkout)
+    result = _git_check_ignore(checkout, relative)
+    result["destination"] = relative.as_posix()
+    result["refused"] = not result["ignored"]
+    return result
+
+
+def materialise_shadow(checkout: Path, destination: Path) -> tuple[str, str, dict[str, Any]]:
+    preflight = _shadow_preflight(checkout, destination)
+    if preflight["refused"]:
+        raise ValueError("shadow destination is not ignored")  # noqa: TRY003
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        "# Private evaluation constraint\n\n" + _PRIVATE_CONSTRAINT + "\n", encoding="utf-8"
+    )
+    file_hash = sha256_file(destination)
+    return file_hash, file_hash, preflight
 
 
 def command_version(executable: str) -> str:
@@ -396,7 +411,7 @@ def frozen_protocol_hash() -> str:
 
 
 def assignment_order(repetitions: int) -> list[tuple[str, int]]:
-    assignments = [(arm, attempt) for attempt in range(1, repetitions + 1) for arm in ("A", "B")]
+    assignments = [(arm, attempt) for attempt in range(1, repetitions + 1) for arm in _VALID_ARMS]
     random.Random(ASSIGNMENT_SEED).shuffle(assignments)
     return assignments
 
@@ -483,20 +498,20 @@ def _launch_manifest(
     }
 
 
-def _prompt_for(arm: str, task: bytes, pack_path: Path | None, checkout: Path) -> bytes:
+def _prompt_for(arm: str, task: bytes, shadow_path: Path | None, checkout: Path) -> bytes:
     instruction = (
         b"\n\nWork only inside this isolated checkout. "
         b"Do not access or modify any parent repository."
     )
     if arm == "A":
         return task + instruction
-    if pack_path is None:
-        raise ValueError("Arm B requires a materialised pack")  # noqa: TRY003
-    relative_pack = pack_path.relative_to(checkout).as_posix()
+    if shadow_path is None:
+        raise ValueError("Arm B requires a materialised shadow file")  # noqa: TRY003
+    relative_shadow = shadow_path.relative_to(checkout).as_posix()
     return (
         task
-        + b"\n\nThe generated context pack is available at: "
-        + relative_pack.encode()
+        + b"\n\nA native shadow context file is materialised at: "
+        + relative_shadow.encode()
         + instruction
         + b"\n"
     )
@@ -746,6 +761,7 @@ def build_record(  # noqa: PLR0913
     pack_hash: str | None,
     post_pack_hash: str | None,
     pack_path: Path | None,
+    shadow_preflight: dict[str, Any] | None,
     dry_run: bool,
     model: str,
     executable: str,
@@ -798,7 +814,7 @@ def build_record(  # noqa: PLR0913
             "order_index": assignment_index,
             "strategy": protocol["assignment"]["arm_order"],
         },
-        "harness_version": "evaluation-0.2.0",
+        "harness_version": "evaluation-0.3.0",
         "model_version": model,
         "tool_versions": {
             "python": sys.version.split()[0],
@@ -822,10 +838,15 @@ def build_record(  # noqa: PLR0913
         },
         "pre_pack_sha256": pack_hash,
         "post_pack_sha256": post_pack_hash,
-        "pack_materialisation": {
-            "boundary": protocol["arms"]["B"].get("materialisation_boundary"),
-            "path": str(pack_path) if pack_path else None,
+        "context_delivery": {
+            "context_type": protocol["arms"][arm].get("context_type"),
+            "delivery_mode": protocol["arms"][arm].get("delivery_mode"),
+            "shadow_destination": protocol["arms"][arm].get("shadow_destination"),
+            "git_ignore_preflight": shadow_preflight,
+            "consumption_observed": False,
+            "consumption_status": "unobserved",
         },
+        "pack_materialisation": {"boundary": None, "path": None},
         "delivery_evidence": {
             "observed": execution is not None and execution.provider_ok if not dry_run else False,
             "oracle_passed": execution.oracle_passed if execution else None,
@@ -907,9 +928,12 @@ def run_evaluation(  # noqa: PLR0913
             pack_hash: str | None = None
             post_pack_hash: str | None = None
             pack_path: Path | None = None
+            shadow_preflight: dict[str, Any] | None = None
             if arm == "B":
-                pack_path = checkout / ".evaluation-pack"
-                pack_hash, post_pack_hash = materialise_pack(checkout, pack_path)
+                pack_path = checkout / _SHADOW_DESTINATION
+                pack_hash, post_pack_hash, shadow_preflight = materialise_shadow(
+                    checkout, pack_path
+                )
             command = [executable, "run", "--auto", "--format", "json", "--dir", str(checkout)]
 
             if model != "UNSPECIFIED":
@@ -937,6 +961,7 @@ def run_evaluation(  # noqa: PLR0913
                     pack_hash=pack_hash,
                     post_pack_hash=post_pack_hash,
                     pack_path=pack_path,
+                    shadow_preflight=shadow_preflight,
                     dry_run=dry_run,
                     model=model,
                     executable=executable,

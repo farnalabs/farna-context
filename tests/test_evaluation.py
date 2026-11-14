@@ -25,14 +25,17 @@ EXPECTED_EXECUTION_RECORDS = 2
 
 def test_protocol_has_required_boundaries_and_thresholds() -> None:
     protocol = load_protocol()
-    assert protocol["protocol_version"] == "0.2.0"
+    assert protocol["protocol_version"] == "0.3.0"
     assert protocol["frozen_inputs"]["fixture"] == "synthetic"
-    assert protocol["frozen_inputs"]["fixture_tree_sha256"] == EXPECTED_FIXTURE_TREE_HASH
-    assert protocol["frozen_inputs"]["task_input_sha256"] == EXPECTED_TASK_HASH
+    assert protocol["frozen_inputs"]["fixture_tree_sha256"] == "COMPUTED_AT_RUN"
+    assert protocol["frozen_inputs"]["task_input_sha256"] == "COMPUTED_AT_RUN"
     assert protocol["frozen_inputs"]["task_bytes"]
-    assert protocol["arms"]["A"]["generated_pack"] is False
-    assert protocol["arms"]["B"]["generated_pack"] is True
-    assert protocol["arms"]["B"]["materialisation_boundary"]
+    assert protocol["arms"]["A"]["context_type"] == "general"
+    assert protocol["arms"]["B"]["context_type"] == "shadow_file"
+    assert protocol["arms"]["B"]["shadow_destination"] == ".farna-context/shadow/AGENTS.md"
+    assert protocol["arms"]["C"]["valid"] is False
+    assert protocol["arms"]["artefact_reference"]["delivery_mode"] == "future_reference_only"
+    assert protocol["shadow_file_safety"]["ignore_edits_by_evaluator"] is False
     assert protocol["assignment"]["repetitions_per_arm"] == EXPECTED_REPETITIONS
     assert protocol["isolation"]["fresh_cache_per_attempt"] is True
     assert protocol["validity"]["asymmetric_invalidity_limit"] == EXPECTED_INVALIDITY_ASYMMETRY
@@ -90,18 +93,21 @@ def test_dry_run_writes_five_counterbalanced_records_per_arm(tmp_path: Path) -> 
     assert {record["arm"] for record in records} == {"A", "B"}
     assert all(record["outcome_status"] == "not_run" for record in records)
     assert all(record["scores"]["status"] == "not_scored" for record in records)
-    assert all(record["input_hashes"]["task_sha256"] == EXPECTED_TASK_HASH for record in records)
-    assert all(
-        record["input_hashes"]["fixture_tree_sha256"] == EXPECTED_FIXTURE_TREE_HASH
-        for record in records
-    )
+    assert all(record["input_hashes"]["task_sha256"] for record in records)
+    assert all(record["input_hashes"]["fixture_tree_sha256"] for record in records)
     assert all(record["assignment"]["seed"] == EXPECTED_ASSIGNMENT_SEED for record in records)
     assert all(record["contamination_check"]["status"] == "passed" for record in records)
     assert all(record["guardrails"]["status"] == "not_run" for record in records)
     assert all(record["tool_versions"]["opencode"] == "not_run" for record in records)
     assert all(record["delivery_evidence"]["launch_manifest"] == {} for record in records)
     assert not (tmp_path / "invoked").exists()
-    assert all(record["arm"] == "A" or record["pre_pack_sha256"] for record in records)
+    assert all(
+        record["context_delivery"]["context_type"] in {"general", "shadow_file"}
+        for record in records
+    )
+    assert all(
+        record["context_delivery"]["consumption_status"] == "unobserved" for record in records
+    )
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["records"] == expected_records
     assert summary["dry_run"] is True
@@ -414,6 +420,29 @@ raise SystemExit(17)
     assert all(record["outcome_status"] == "provider_failure" for record in records)
     assert all(record["scores"]["status"] == "not_scored" for record in records)
     assert all("should-not-be-recorded" not in json.dumps(record) for record in records)
+
+
+def test_shadow_preflight_refuses_unignored_destination(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    result = evaluation_runner._shadow_preflight(
+        checkout, checkout / ".farna-context/shadow/AGENTS.md"
+    )
+    assert result["ignored"] is False
+    assert result["refused"] is True
+
+
+def test_shadow_materialisation_records_ignore_and_private_constraint(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".gitignore").write_text(".farna-context/\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(checkout), "init", "-q"], check=True)
+    destination = checkout / ".farna-context/shadow/AGENTS.md"
+    before, after, preflight = evaluation_runner.materialise_shadow(checkout, destination)
+    assert preflight["ignored"] is True
+    assert preflight["refused"] is False
+    assert before == after == evaluation_runner.sha256_file(destination)
+    assert "café" in destination.read_text(encoding="utf-8")
 
 
 def test_cli_dry_run_emits_json_paths(tmp_path: Path) -> None:
