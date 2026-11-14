@@ -158,6 +158,39 @@ print(json.dumps({'prompt_sha256': len(prompt)}))
     )
 
 
+def test_transient_cache_disappearance_returns_records(tmp_path: Path) -> None:
+    executable = _fake_executable(
+        tmp_path,
+        """
+import threading
+import time
+from pathlib import Path
+
+cache_file = Path('.transient-cache-marker')
+cache_file.write_text('transient', encoding='utf-8')
+def remove_cache() -> None:
+    time.sleep(0.01)
+    cache_file.unlink(missing_ok=True)
+threading.Thread(target=remove_cache).start()
+while cache_file.exists():
+    time.sleep(0.001)
+""",
+    )
+    results_path, summary_path = run_evaluation(
+        fixture=synthetic_fixture(),
+        output_dir=tmp_path / "runs",
+        repetitions=1,
+        dry_run=False,
+        model="UNSPECIFIED",
+        executable=str(executable),
+    )
+    records = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines()]
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert len(records) == EXPECTED_EXECUTION_RECORDS
+    assert summary["records"] == EXPECTED_EXECUTION_RECORDS
+    assert all("validity" in record for record in records)
+
+
 def test_fake_process_cannot_contaminate_parent_checkout(tmp_path: Path, monkeypatch) -> None:
     parent = tmp_path / "parent"
     parent.mkdir()
