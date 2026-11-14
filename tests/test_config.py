@@ -7,10 +7,10 @@ import pytest
 
 from src.farna_context.config import (
     LocalConfig,
-    SourceScope,
-    TaskOverlay,
     OutputFiles,
     SecretPatterns,
+    SourceScope,
+    TaskOverlay,
     load_config,
     save_config,
 )

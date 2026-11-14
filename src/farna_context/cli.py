@@ -14,6 +14,7 @@ from .exceptions import (
     CompilationError,
     InputChangedError,
     InvalidManifestError,
+    RequiredSourceError,
     SecretDetectedError,
 )
 from .git import GitError, get_repo_root, get_revision
@@ -174,24 +175,17 @@ def manifest(
 @app.command()
 def compile(
     manifest_path: Annotated[
-        Path | None, typer.Option("--manifest", help="Manifest JSON path")
-    ] = None,
-    output: Annotated[
-        Path | None, typer.Option("--out", "--output", "-o", help="Pack JSON path")
-    ] = None,
+        Path, typer.Option("--manifest", help="Manifest JSON path", exists=True, readable=True)
+    ],
+    output: Annotated[Path, typer.Option("--out", "--output", "-o", help="Pack JSON path")],
     config_path: Annotated[
-        Path | None, typer.Option("--config", "-c", help="Config JSON path")
-    ] = None,
+        Path, typer.Option("--config", "-c", help="Config JSON path", exists=True, readable=True)
+    ],
 ) -> None:
     """Compile a deterministic Context Pack from a manifest."""
     try:
-        if manifest_path is None:
-            _exit_with_error(ExitCode.INVALID_ARGS)
-        resolved_manifest = manifest_path
-        assert resolved_manifest is not None
-        output_path = output or resolved_manifest.with_name("pack.json")
-        pack = compile_manifest(resolved_manifest, output_path, config_path)
-        console.print(f"Context pack written to {output_path}")
+        pack = compile_manifest(manifest_path, output, config_path)
+        console.print(f"Context pack written to {output}")
         console.print(f"Pack hash: {pack.pack_hash}")
     except InputChangedError as exc:
         console.print(str(exc))
@@ -199,11 +193,21 @@ def compile(
     except SecretDetectedError as exc:
         console.print(str(exc))
         _exit_with_error(ExitCode.SECRET_DETECTED)
-    except (InvalidManifestError, CompilationError) as exc:
+    except InvalidManifestError as exc:
         console.print(f"Error: {exc}")
         _exit_with_error(ExitCode.INVALID_ARGS)
-    except OSError as exc:
-        _handle_generic_error(exc, ExitCode.COMPILATION_ERROR)
+    except RequiredSourceError as exc:
+        console.print(f"Error: {exc}")
+        _exit_with_error(ExitCode.REQUIRED_ISSUE)
+    except CompilationError as exc:
+        console.print(f"Error: {exc}")
+        _exit_with_error(ExitCode.REQUIRED_ISSUE)
+    except OSError:
+        console.print("Error: unable to write context pack")
+        _exit_with_error(ExitCode.WRITE_ERROR)
+    except Exception:
+        console.print("Error: compilation failed")
+        _exit_with_error(ExitCode.COMPILATION_ERROR)
 
 
 @app.command()

@@ -1,18 +1,19 @@
 """Tests for git module."""
 
+import subprocess
 import tempfile
 from pathlib import Path
 
 import pytest
 
+from src.farna_context.constants import ExitCode
 from src.farna_context.git import (
+    GitError,
+    check_dirty_tree,
     get_repo_root,
     get_revision,
-    check_dirty_tree,
     is_repo_clean,
-    GitError,
 )
-from src.farna_context.constants import ExitCode
 
 
 class TestGitUtils:
@@ -25,9 +26,10 @@ class TestGitUtils:
             repo_path.mkdir()
 
             # Initialize git repo
-            import subprocess
             subprocess.run(["git", "init"], cwd=repo_path, check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True
+            )
             subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_path, check=True)
 
             # Create a file and commit
@@ -56,9 +58,10 @@ class TestGitUtils:
             repo_path = Path(tmpdir) / "test_repo"
             repo_path.mkdir()
 
-            import subprocess
             subprocess.run(["git", "init"], cwd=repo_path, check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True
+            )
             subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_path, check=True)
 
             (repo_path / "README.md").write_text("# Test")
@@ -66,7 +69,7 @@ class TestGitUtils:
             subprocess.run(["git", "commit", "-m", "Initial"], cwd=repo_path, check=True)
 
             revision = get_revision(repo_path)
-            assert len(revision) == 40  # Full SHA
+            assert len(revision) == 40  # noqa: PLR2004
             assert all(c in "0123456789abcdef" for c in revision)
 
     def test_check_dirty_tree_clean(self):
@@ -75,9 +78,10 @@ class TestGitUtils:
             repo_path = Path(tmpdir) / "test_repo"
             repo_path.mkdir()
 
-            import subprocess
             subprocess.run(["git", "init"], cwd=repo_path, check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True
+            )
             subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_path, check=True)
 
             (repo_path / "README.md").write_text("# Test")
@@ -96,9 +100,10 @@ class TestGitUtils:
             repo_path = Path(tmpdir) / "test_repo"
             repo_path.mkdir()
 
-            import subprocess
             subprocess.run(["git", "init"], cwd=repo_path, check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True
+            )
             subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_path, check=True)
 
             (repo_path / "README.md").write_text("# Test")
@@ -120,9 +125,10 @@ class TestGitUtils:
             repo_path = Path(tmpdir) / "test_repo"
             repo_path.mkdir()
 
-            import subprocess
             subprocess.run(["git", "init"], cwd=repo_path, check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True
+            )
             subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_path, check=True)
 
             (repo_path / "README.md").write_text("# Test")
@@ -142,9 +148,10 @@ class TestGitUtils:
             repo_path = Path(tmpdir) / "test_repo"
             repo_path.mkdir()
 
-            import subprocess
             subprocess.run(["git", "init"], cwd=repo_path, check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True
+            )
             subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_path, check=True)
 
             (repo_path / "README.md").write_text("# Test")
@@ -163,9 +170,10 @@ class TestGitUtils:
             repo_path = Path(tmpdir) / "test_repo"
             repo_path.mkdir()
 
-            import subprocess
             subprocess.run(["git", "init"], cwd=repo_path, check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True
+            )
             subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_path, check=True)
 
             (repo_path / "README.md").write_text("# Test")
