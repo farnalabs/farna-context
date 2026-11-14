@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 from .authority import SourceRecord as AuthoritySourceRecord
 from .authority import resolve_authority
-from .config import LocalConfig
+from .config import LocalConfig, load_config
 from .git import check_dirty_tree, get_revision
 
 # Type alias for source classification
@@ -543,10 +543,11 @@ def _audit_payload(
 def run_audit(config_path: Path, out_path: Path) -> int:
     """Run the full audit, write canonical audit.json, and return its exit code."""
     try:
-        from .config import load_config
-
         config = load_config(config_path)
-        repo_root = config.get_repo_root_path(config_path.parent)
+        config_dir = config_path.parent
+        if config_dir.name == ".farna-context":
+            config_dir = config_dir.parent
+        repo_root = config.get_repo_root_path(config_dir)
         revision = get_revision(repo_root)
         initial_dirty = check_dirty_tree(repo_root)
         sources = audit_sources(config, repo_root)
@@ -561,24 +562,21 @@ def run_audit(config_path: Path, out_path: Path) -> int:
         )
         payload = _audit_payload(result, repo_root, revision, config_hash, task_hash)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        print(
+        out_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(  # noqa: T201
             f"Audit: {result.total_discovered} discovered, "
             f"{result.total_included} included, {result.total_conflicts} conflicts",
             file=sys.stdout,
         )
         if initial_dirty:
-            print(
+            print(  # noqa: T201
                 f"Blocking issue: input changed ({len(initial_dirty)} dirty paths)",
                 file=sys.stdout,
             )
             return 11
         blocking = any(
-            source.required and (not source.readable or source.is_conflict)
-            for source in sources
+            source.required and (not source.readable or source.is_conflict) for source in sources
         )
-        return 10 if blocking else 0
+        return 10 if blocking else 0  # noqa: TRY300
     except (ValueError, OSError, json.JSONDecodeError):
         return 2

@@ -121,6 +121,7 @@ def manifest(
 ) -> None:
     """Generate a canonical JSON manifest from an audit JSON file."""
     try:
+        exit_code = 0
         if audit_path is not None:
             output_path = output or Path(".farna-context/manifest.json")
             exit_code = run_manifest(audit_path, output_path)
@@ -132,10 +133,11 @@ def manifest(
                 console.print("[red]Audit input changed since it was recorded[/red]")
             else:
                 console.print("[red]Invalid audit[/red]")
-        if exit_code:
-            _exit_with_error(
-                ExitCode(exit_code) if exit_code in {0, 2, 10, 11} else ExitCode.MANIFEST_ERROR
-            )
+        if audit_path is not None:
+            if exit_code:
+                _exit_with_error(
+                    ExitCode(exit_code) if exit_code in {0, 2, 10, 11} else ExitCode.MANIFEST_ERROR
+                )
             return
 
         config, repo_root = _get_config_and_repo(config_path)
