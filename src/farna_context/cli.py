@@ -9,7 +9,7 @@ from typing import Annotated
 import typer
 from rich.console import Console
 
-from .audit import AuditContext, audit_sources, collect_audit_result, run_audit
+from .audit import AuditContext, AuditResult, audit_sources, collect_audit_result, run_audit
 from .compile import compile_manifest
 from .config import LocalConfig, load_config, save_config
 from .constants import CONFIG_FILE, ExitCode, OutcomeStatus, RequestedBy
@@ -23,7 +23,7 @@ from .exceptions import (
 from .git import GitError, check_dirty_tree, get_repo_root, get_revision
 from .manifest import generate_manifest, run_manifest
 from .materialise import materialise_files, materialise_pack, materialise_to_stdout
-from .receipt import generate_receipt
+from .receipt import generate_receipt, load_receipt_artefact
 from .secrets import scan_sources
 from .utils import atomic_write_bytes, canonical_json_bytes
 from .verify import verify_all
@@ -357,8 +357,7 @@ def verify(
         ),
     ],
     output: Annotated[
-        Path,
-        typer.Option("--out", "--output", "-o", help="Existing pack or materialisation path"),
+        Path, typer.Option("--out", "--output", "-o", help="Existing pack or materialisation path")
     ],
 ) -> None:
     """Verify an existing materialisation plan and output without writing."""
@@ -399,33 +398,77 @@ def verify(
 
 
 @app.command()
-def receipt(
+def receipt(  # noqa: PLR0913, PLR0917
+    init_path: Annotated[Path | None, typer.Option("--init")] = None,
+    audit_path: Annotated[Path | None, typer.Option("--audit")] = None,
+    manifest_path: Annotated[Path | None, typer.Option("--manifest")] = None,
+    pack_path: Annotated[Path | None, typer.Option("--pack")] = None,
+    materialisation_path: Annotated[Path | None, typer.Option("--materialisation")] = None,
+    verification_path: Annotated[Path | None, typer.Option("--verification")] = None,
+    output: Annotated[Path | None, typer.Option("--out", "--output", "-o")] = None,
     config_path: Annotated[
-        Path | None, typer.Option("--config", "-c", help="Path to config file")
+        Path | None, typer.Option("--config", "-c", help="Legacy config path")
     ] = None,
-    output: Annotated[Path | None, typer.Option("--output", "-o", help="Output file path")] = None,
     requested_by: Annotated[
         str, typer.Option("--requested-by", help="Who requested the operation")
     ] = "human",
     outcome: Annotated[str, typer.Option("--outcome", help="Operation outcome")] = "success",
 ) -> None:
-    """Generate operation receipt."""
+    """Write a receipt from the seven explicit lifecycle artefacts."""
     try:
+        artefact_inputs = (
+            init_path,
+            audit_path,
+            manifest_path,
+            pack_path,
+            materialisation_path,
+            verification_path,
+        )
+        if any(value is not None for value in artefact_inputs):
+            if any(value is None for value in artefact_inputs) or output is None:
+                _exit_with_error(ExitCode.INVALID_ARGS)
+            assert init_path and audit_path and manifest_path and pack_path
+            assert materialisation_path and verification_path and output
+            artefact_paths = {
+                "init": init_path,
+                "audit": audit_path,
+                "manifest": manifest_path,
+                "pack": pack_path,
+                "materialisation": materialisation_path,
+                "verification": verification_path,
+            }
+            artefacts = {
+                name: load_receipt_artefact(path, name) for name, path in artefact_paths.items()
+            }
+            config, repo_root = _get_config_and_repo(config_path)
+            revision = str(artefacts["init"].get("revision", "unknown"))
+            receipt_obj = generate_receipt(
+                config=config,
+                audit=AuditResult(),
+                manifest=generate_manifest(config, AuditResult(), repo_root, revision),
+                revision=revision,
+                artefacts=artefacts,
+                requested_by=RequestedBy(requested_by),
+                outcome=OutcomeStatus(outcome),
+            )
+            receipt_obj.save(output)
+            console.print(f"[green]Receipt written to {output}[/green]")
+            return
+
         config, repo_root = _get_config_and_repo(config_path)
         revision = get_revision(repo_root)
-
         sources = audit_sources(config, repo_root)
-        audit_context = AuditContext(
-            config=config,
-            repo_root=repo_root,
-            revision=revision,
-            sources=sources,
-            task_brief_hash="",
-            config_hash="",
+        audit_result = collect_audit_result(
+            AuditContext(
+                config=config,
+                repo_root=repo_root,
+                revision=revision,
+                sources=sources,
+                task_brief_hash="",
+                config_hash="",
+            )
         )
-        audit_result = collect_audit_result(audit_context)
         manifest_obj = generate_manifest(config, audit_result, repo_root, revision)
-
         receipt_obj = generate_receipt(
             config=config,
             audit=audit_result,
@@ -434,16 +477,16 @@ def receipt(
             requested_by=RequestedBy(requested_by),
             outcome=OutcomeStatus(outcome),
         )
-
         output_path = output or Path(config.output_files.receipt)
         receipt_obj.save(output_path)
-
         console.print(f"[green]Receipt written to {output_path}[/green]")
 
     except GitError as e:
         _handle_git_error(e)
+    except typer.Exit:
+        raise
     except Exception as e:
-        _handle_generic_error(e, ExitCode.CONFIG_ERROR)
+        _handle_generic_error(e, ExitCode.RECEIPT_ERROR)
 
 
 @app.command()
