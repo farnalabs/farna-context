@@ -143,6 +143,44 @@ def test_secret_source_is_omitted_without_raw_hash(tmp_path: Path) -> None:
     assert "raw_source_sha256" not in json.dumps(pack.payload)
 
 
+def test_database_configuration_references_are_selected(tmp_path: Path) -> None:
+    manifest, config, source = _fixture(tmp_path)
+    source.write_bytes(
+        b'os.environ.get("DATABASE_URL")\n'
+        b"DATABASE_URL=postgresql+asyncpg://...\n"
+        b"DATABASE_URL=${DATABASE_URL} $DATABASE_URL {{ secrets.DATABASE_URL }}\n"
+    )
+    config.write_text(
+        json.dumps(
+            {
+                "repo_root": str(tmp_path / "repo"),
+                "secret_patterns": {"named_detectors": ["database_url"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    pack = compile_manifest(manifest, tmp_path / "pack.json", config)
+    assert [source["path"] for source in pack.payload["selected_sources"]] == ["AGENTS.md"]
+    assert not pack.payload["omitted_sources"]
+
+
+def test_concrete_database_url_is_omitted(tmp_path: Path) -> None:
+    manifest, config, source = _fixture(tmp_path)
+    source.write_bytes(b"postgresql://user:password@localhost/app\n")
+    config.write_text(
+        json.dumps(
+            {
+                "repo_root": str(tmp_path / "repo"),
+                "secret_patterns": {"named_detectors": ["database_url"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    pack = compile_manifest(manifest, tmp_path / "pack.json", config)
+    assert not pack.payload["selected_sources"]
+    assert pack.payload["omitted_sources"][0]["reason"] == "secret_pattern_match"
+
+
 def test_required_secret_blocks(tmp_path: Path) -> None:
     manifest, config, source = _fixture(tmp_path, secret=True)
     source.write_bytes(b"literal-secret\n")
