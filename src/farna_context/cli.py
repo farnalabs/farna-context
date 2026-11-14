@@ -5,9 +5,8 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
-from rich.table import Table
 
-from .audit import AuditContext, audit_sources, collect_audit_result
+from .audit import AuditContext, audit_sources, collect_audit_result, run_audit
 from .compile import compile_context_pack
 from .config import LocalConfig, load_config, save_config
 from .constants import CONFIG_FILE, ExitCode, OutcomeStatus, RequestedBy
@@ -95,58 +94,19 @@ def audit(
     config_path: Annotated[
         Path | None, typer.Option("--config", "-c", help="Path to config file")
     ] = None,
+    out_path: Annotated[Path | None, typer.Option("--out", help="Path for audit.json")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Verbose output")] = False,
 ) -> None:
-    """Audit source files based on configuration."""
-    try:
-        config, repo_root = _get_config_and_repo(config_path)
-
-        console.print(f"[bold]Repository:[/bold] {repo_root}")
-        console.print(f"[bold]Config:[/bold] {config_path or 'default'}")
-
-        sources = audit_sources(config, repo_root)
-        audit_context = AuditContext(
-            config=config,
-            repo_root=repo_root,
-            revision=get_revision(repo_root),
-            sources=sources,
-            task_brief_hash="",
-            config_hash="",
+    """Audit source files and write audit.json."""
+    del verbose
+    resolved_config = config_path or (Path.cwd() / CONFIG_FILE)
+    resolved_out = out_path or (resolved_config.parent / "audit.json")
+    exit_code = run_audit(resolved_config, resolved_out)
+    console.print(f"Audit output: {resolved_out}")
+    if exit_code:
+        _exit_with_error(
+            ExitCode(exit_code) if exit_code in {0, 2, 10, 11} else ExitCode.CONFIG_ERROR
         )
-        audit_result = collect_audit_result(audit_context)
-
-        # Summary table
-        table = Table(title="Audit Results")
-        table.add_column("Category", style="cyan")
-        table.add_column("Count", style="magenta")
-        table.add_row("Instruction files", str(len(audit_result.instruction_files)))
-        table.add_row("Explicit files", str(len(audit_result.explicit_files)))
-        table.add_row("Skills files", str(len(audit_result.skills_files)))
-        table.add_row("Scoped files", str(len(audit_result.scoped_files)))
-        table.add_row("Missing required", str(len(audit_result.missing_required)))
-        table.add_row("Errors", str(len(audit_result.errors)))
-        console.print(table)
-
-        if verbose:
-            if audit_result.instruction_files:
-                console.print("\n[bold]Instruction files:[/bold]")
-                for f in audit_result.instruction_files:
-                    console.print(f"  {f.relative_to(repo_root)}")
-
-            if audit_result.missing_required:
-                console.print("\n[bold red]Missing required:[/bold red]")
-                for m in audit_result.missing_required:
-                    console.print(f"  {m}")
-
-            if audit_result.errors:
-                console.print("\n[bold red]Errors:[/bold red]")
-                for e in audit_result.errors:
-                    console.print(f"  {e}")
-
-    except GitError as e:
-        _handle_git_error(e)
-    except Exception as e:
-        _handle_generic_error(e, ExitCode.CONFIG_ERROR)
 
 
 @app.command()

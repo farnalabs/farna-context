@@ -1,15 +1,28 @@
 """Source discovery and audit for Farna Context."""
 
 import hashlib
+import json
+import sys
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from .config import LocalConfig
+from .authority import SourceRecord as AuthoritySourceRecord
+from .authority import resolve_authority
+from .config import LocalConfig, load_config
+from .git import check_dirty_tree, get_revision
 
 # Type alias for source classification
 SourceClass = Literal["instruction", "explicit", "skills", "scoped"]
+
+_SOURCE_CLASS_NAMES = {
+    "instruction": "agents_md",
+    "explicit": "explicit",
+    "skills": "skills_rules",
+    "scoped": "scoped",
+}
 
 
 @dataclass
@@ -25,6 +38,17 @@ class SourceRecord:
     raw_hash: str | None = None
     included: bool = False
     exclusion_reason: str | None = None
+    path_scope: str = "/"
+    precedence: int = 100
+    is_conflict: bool = False
+    conflict_detail: str | None = None
+
+
+def _output_source_class(source: SourceRecord) -> str:
+    """Return the public source class used by audit.json."""
+    if source.source_class == "instruction" and source.path.name.upper() == "CLAUDE.MD":
+        return "claude_md"
+    return _SOURCE_CLASS_NAMES[source.source_class]
 
 
 @dataclass
@@ -353,9 +377,7 @@ def _update_counts(result: AuditResult) -> None:
     result.total_excluded = sum(1 for s in result.sources if not s.included and s.configured)
     result.total_informational = sum(1 for s in result.sources if not s.configured)
 
-    # Count conflicts (same path from different source classes with
-    # different precedence). For now, track as 0 - will be enhanced later.
-    result.total_conflicts = 0
+    result.total_conflicts = sum(1 for source in result.sources if source.is_conflict)
 
     # Per-class breakdown
     for src in result.sources:
@@ -404,3 +426,158 @@ def audit_sources(config: LocalConfig, repo_root: Path) -> list[SourceRecord]:
     sources = discover_sources(config, repo_root)
     sources = assess_readability(sources, repo_root)
     return make_inclusion_decisions(sources, config, repo_root)
+
+
+def _config_hash(config: LocalConfig, config_path: Path | None) -> str:
+    """Hash the canonical configuration, falling back to its model data."""
+    if config_path is not None and config_path.exists():
+        raw = config_path.read_bytes()
+    else:
+        raw = json.dumps(
+            config.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        ).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _task_brief_hash(config: LocalConfig, repo_root: Path) -> str:
+    """Return the task brief hash, or an empty hash when no brief is configured."""
+    brief = config.task_overlay.task_brief_path or config.task_brief_path
+    if brief is None:
+        return ""
+    path = repo_root / brief
+    if not path.is_file():
+        return ""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _source_path_scope(config: LocalConfig, path: Path, repo_root: Path) -> str:
+    """Find the longest configured scope containing a source."""
+    relative = path.relative_to(repo_root)
+    matches = [
+        scope
+        for scope in config.source_scope.path_scopes
+        if str(relative).startswith(scope.rstrip("/") + "/") or str(relative) == scope
+    ]
+    return "/" if not matches else max(matches, key=len)
+
+
+def _source_precedence(config: LocalConfig, source_class: SourceClass) -> int:
+    """Resolve configured precedence, retaining a stable default."""
+    names = {_SOURCE_CLASS_NAMES[source_class], source_class}
+    for index, item in enumerate(config.source_scope.precedence):
+        if item in names:
+            return index
+    return 100
+
+
+def _apply_authority(sources: list[SourceRecord], config: LocalConfig, repo_root: Path) -> None:
+    """Decorate records with authority and conflict information."""
+    authority_sources = [
+        AuthoritySourceRecord(
+            path=str(source.path.relative_to(repo_root)),
+            path_scope=source.path_scope,
+            precedence=source.precedence,
+            source_type=source.source_class,
+            is_required=source.required,
+            is_readable=source.readable is not False,
+            is_safe=source.included or source.exclusion_reason is not None,
+        )
+        for source in sources
+    ]
+    authority = resolve_authority(authority_sources, config, "")
+    conflicts_by_path: dict[str, list[str]] = {}
+    for conflict in authority.conflicts:
+        for path in conflict.source_paths:
+            conflicts_by_path.setdefault(path, []).extend(
+                other for other in conflict.source_paths if other != path
+            )
+    for source in sources:
+        relative = str(source.path.relative_to(repo_root))
+        details = conflicts_by_path.get(relative, [])
+        source.is_conflict = bool(details)
+        source.conflict_detail = ", ".join(sorted(set(details))) if details else None
+        if source.is_conflict:
+            source.included = False
+            source.exclusion_reason = "Authority conflict"
+
+
+def _source_to_json(source: SourceRecord, repo_root: Path) -> dict[str, Any]:
+    """Serialize a source record using the audit.json contract."""
+    return {
+        "path": str(source.path.relative_to(repo_root)),
+        "source_class": _output_source_class(source),
+        "path_scope": source.path_scope,
+        "precedence": source.precedence,
+        "required": source.required,
+        "readable": source.readable is True,
+        "read_error": source.read_error,
+        "raw_hash": source.raw_hash,
+        "included": source.included,
+        "exclusion_reason": source.exclusion_reason,
+        "is_conflict": source.is_conflict,
+        "conflict_detail": source.conflict_detail,
+    }
+
+
+def _audit_payload(
+    result: AuditResult,
+    repo_root: Path,
+    revision: str,
+    config_hash: str,
+    task_hash: str,
+) -> dict[str, Any]:
+    """Build the canonical audit JSON payload."""
+    by_class = {key: value["discovered"] for key, value in result.by_class.items()}
+    return {
+        "repo_root": str(repo_root.resolve()),
+        "revision": revision,
+        "config_hash": config_hash,
+        "task_brief_hash": task_hash,
+        "timestamp": datetime.now(UTC).isoformat(),
+        "sources": [_source_to_json(source, repo_root) for source in result.sources],
+        "summary": {
+            "total_discovered": result.total_discovered,
+            "total_readable": result.total_readable,
+            "total_included": result.total_included,
+            "total_excluded": result.total_excluded,
+            "total_conflicts": result.total_conflicts,
+            "total_informational": result.total_informational,
+            "by_class": by_class,
+        },
+    }
+
+
+def run_audit(config_path: Path, out_path: Path) -> int:
+    """Run the full audit, write canonical audit.json, and return its exit code."""
+    try:
+        config = load_config(config_path)
+        repo_root = config.get_repo_root_path(config_path.parent)
+        revision = get_revision(repo_root)
+        initial_dirty = check_dirty_tree(repo_root)
+        sources = audit_sources(config, repo_root)
+        for source in sources:
+            source.path_scope = _source_path_scope(config, source.path, repo_root)
+            source.precedence = _source_precedence(config, source.source_class)
+        _apply_authority(sources, config, repo_root)
+        config_hash = _config_hash(config, config_path)
+        task_hash = _task_brief_hash(config, repo_root)
+        result = collect_audit_result(
+            AuditContext(config, repo_root, revision, sources, task_hash, config_hash)
+        )
+        payload = _audit_payload(result, repo_root, revision, config_hash, task_hash)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        sys.stdout.write(
+            f"Audit: {result.total_discovered} discovered, "
+            f"{result.total_included} included, {result.total_conflicts} conflicts\n"
+        )
+        if initial_dirty:
+            sys.stdout.write(f"Blocking issue: input changed ({len(initial_dirty)} dirty paths)\n")
+            return 11
+        blocking = any(
+            source.required and (not source.readable or source.is_conflict) for source in sources
+        )
+    except (ValueError, OSError, json.JSONDecodeError):
+        return 2
+    else:
+        return 10 if blocking else 0
