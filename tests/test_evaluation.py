@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import evaluation.run_evaluation as evaluation_runner
 from evaluation.run_evaluation import load_protocol, run_evaluation, synthetic_fixture
 from evaluation.scoring import DECISION_THRESHOLDS, classify_attempt, score_task
 
@@ -154,6 +155,39 @@ print(json.dumps({'prompt_sha256': len(prompt)}))
     assert (
         json.loads(summary_path.read_text(encoding="utf-8"))["records"]
         == EXPECTED_EXECUTION_RECORDS
+    )
+
+
+def test_fake_process_cannot_contaminate_parent_checkout(tmp_path: Path, monkeypatch) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    marker = parent / "parent-marker.txt"
+    marker.write_text("before", encoding="utf-8")
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    executable = _fake_executable(
+        tmp_path,
+        """
+from pathlib import Path
+import os
+Path('cwd-marker.txt').write_text(os.getcwd(), encoding='utf-8')
+Path.cwd().parent.joinpath('parent', 'unexpected.txt').write_text('bad', encoding='utf-8')
+""",
+    )
+    monkeypatch.setattr(evaluation_runner, "parent_repository_root", lambda: parent)
+    result = evaluation_runner.execute_attempt(
+        arm="A",
+        checkout=checkout,
+        task=b"work",
+        pack_path=None,
+        command=[str(executable), "run"],
+        timeout=30,
+    )
+    assert (checkout / "cwd-marker.txt").read_text(encoding="utf-8") == str(checkout)
+    assert result.contamination_ok is False
+    assert (
+        result.contamination_evidence["parent_before"]["tree_hash"]
+        != result.contamination_evidence["parent_after"]["tree_hash"]
     )
 
 
