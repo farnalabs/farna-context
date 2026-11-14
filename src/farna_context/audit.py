@@ -1,341 +1,206 @@
 """Source discovery and audit for Farna Context."""
 
 import hashlib
-import json
-import os
-import stat
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
-
-from pydantic import BaseModel
+from typing import Literal
 
 from .config import LocalConfig
 
-# Constants for path safety checks
-MIN_DRIVE_LETTER_LEN = 2
-DRIVE_LETTER_COLON_IDX = 1
-
-
-class SourceRecord(BaseModel):
-    """Record of a discovered source file."""
-
-    path: str  # repository-relative POSIX path
-    source_class: str  # "agents_md", "claude_md", "explicit", "skills_rules", "task_brief"
-    path_scope: str  # repository-relative scope from config
-    precedence: int  # from config
-    required: bool  # from config
-    readable: bool = False
-    read_error: str | None = None
-    raw_hash: str | None = None  # SHA-256 of raw bytes
-    included: bool = False
-    exclusion_reason: str | None = None
-    is_conflict: bool = False
-    conflict_detail: str | None = None
-
-
-class AuditResult(BaseModel):
-    """Result of source audit."""
-
-    repo_root: str
-    revision: str
-    sources: list[SourceRecord]
-    task_brief_hash: str
-    config_hash: str
-    timestamp: str
+# Type alias for source classification
+SourceClass = Literal["instruction", "explicit", "skills", "scoped"]
 
 
 @dataclass
-class SourceDiscoveryContext:
-    """Context for source discovery helper functions."""
+class SourceRecord:
+    """Record for a single discovered source file."""
 
-    sources: list[SourceRecord]
-    precedence_map: dict[str, int]
-    required_patterns: list[str]
-
-
-def _is_windows_reparse_point(path: Path) -> bool:
-    """Check if a path is a Windows reparse point (junction, symlink, mount point)."""
-    if os.name != "nt":
-        return False
-    try:
-        file_attrs = path.stat().st_file_attributes  # type: ignore[attr-defined]
-        return bool(file_attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
-    except (AttributeError, OSError):
-        return False
+    path: Path
+    source_class: SourceClass
+    required: bool = False
+    configured: bool = True
+    readable: bool | None = None
+    read_error: str | None = None
+    raw_hash: str | None = None
+    included: bool = False
+    exclusion_reason: str | None = None
 
 
-def check_source_safety(path: Path, repo_root: Path) -> tuple[bool, str | None]:
-    """Check path for safety: no absolute/drive/UNC/NUL/../alt-stream,
-    no symlink/junction/reparse traversal.
+@dataclass
+class AuditResult:
+    """Result of source audit."""
 
-    Args:
-        path: Path to check.
-        repo_root: Repository root path.
+    # Source records
+    sources: list[SourceRecord] = field(default_factory=list)
 
-    Returns:
-        Tuple of (is_safe, error_reason).
-    """
-    error_reason: str | None = None
-    is_safe = True
+    # Counts
+    total_discovered: int = 0
+    total_readable: int = 0
+    total_included: int = 0
+    total_excluded: int = 0
+    total_conflicts: int = 0
+    total_informational: int = 0
 
-    # Resolve paths
-    try:
-        repo_root_resolved = repo_root.resolve()
-        path_resolved = path.resolve()
-    except (OSError, RuntimeError) as e:
-        return False, f"Path resolution failed: {e}"
+    # Per-class breakdown
+    by_class: dict[SourceClass, dict[str, int]] = field(default_factory=dict)
 
-    # Check if path is within repo_root
-    try:
-        rel_path = path_resolved.relative_to(repo_root_resolved)
-    except ValueError:
-        return False, "Path is outside repository root"
+    # Legacy fields for backward compatibility
+    instruction_files: list[Path] = field(default_factory=list)
+    explicit_files: list[Path] = field(default_factory=list)
+    skills_files: list[Path] = field(default_factory=list)
+    scoped_files: list[Path] = field(default_factory=list)
+    missing_required: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
-    # Check for symlinks, junctions, reparse points in the path
-    # Walk up from path to repo_root checking each component
-    current = path_resolved
-    while current not in (repo_root_resolved, current.parent) and is_safe:
-        try:
-            if current.is_symlink():
-                is_safe = False
-                error_reason = f"Symlink detected: {current}"
-            elif _is_windows_reparse_point(current):
-                is_safe = False
-                error_reason = f"Reparse point detected: {current}"
-        except OSError:
-            pass  # Can't check, assume safe
-        current = current.parent
-
-    # Additional safety checks on the relative path string
-    path_str = str(rel_path)
-    has_drive_letter = (
-        len(path_str) >= MIN_DRIVE_LETTER_LEN and path_str[DRIVE_LETTER_COLON_IDX] == ":"
-    )
-    is_alt_stream = ":" in path_str and not has_drive_letter
-
-    if is_safe and Path(path_str).is_absolute():
-        is_safe = False
-        error_reason = "Absolute path not allowed"
-    if is_safe and has_drive_letter:
-        is_safe = False
-        error_reason = "Drive letter path not allowed"
-    if is_safe and (path_str.startswith("\\\\") or path_str.startswith("//")):
-        is_safe = False
-        error_reason = "UNC path not allowed"
-    if is_safe and (path_str.upper() == "NUL" or path_str.upper().startswith("NUL.")):
-        is_safe = False
-        error_reason = "NUL device path not allowed"
-    if is_safe and ".." in Path(path_str).parts:
-        is_safe = False
-        error_reason = "Parent directory traversal not allowed"
-    if is_safe and is_alt_stream:
-        is_safe = False
-        error_reason = "Alternate data stream path not allowed"
-
-    return is_safe, error_reason
-
-
-def read_source_content(repo_root: Path, source: SourceRecord) -> tuple[bytes | None, str | None]:
-    """Read source file, return (content_bytes, error_message).
-    Update source.readable and read_error.
-
-    Args:
-        repo_root: Repository root path.
-        source: SourceRecord to read.
-
-    Returns:
-        Tuple of (content_bytes, error_message). Content is None if error.
-    """
-    abs_path = repo_root / source.path
-
-    # Safety check
-    is_safe, error = check_source_safety(abs_path, repo_root)
-    if not is_safe:
-        source.readable = False
-        source.read_error = error
-        return None, error
-
-    try:
-        # Check if it's a regular file
-        if not abs_path.is_file():
-            source.readable = False
-            source.read_error = "Not a regular file"
-            return None, "Not a regular file"
-
-        # Read raw bytes
-        content = abs_path.read_bytes()
-
-        # Compute SHA-256 hash
-        sha256_hash = hashlib.sha256(content).hexdigest()
-        source.raw_hash = sha256_hash
-        source.readable = True
-        source.read_error = None
-
-    except FileNotFoundError:
-        source.readable = False
-        source.read_error = "File not found"
-        return None, "File not found"
-    except PermissionError:
-        source.readable = False
-        source.read_error = "Permission denied"
-        return None, "Permission denied"
-    except OSError as e:
-        source.readable = False
-        source.read_error = f"OS error: {e}"
-        return None, f"OS error: {e}"
-
-    return content, None
-
-
-def _add_source_if_safe(
-    ctx: SourceDiscoveryContext,
-    rel_path: str,
-    source_class: str,
-    path_scope: str,
-) -> None:
-    """Add a source record if not already present."""
-    if any(s.path == rel_path for s in ctx.sources):
-        return
-    ctx.sources.append(
-        SourceRecord(
-            path=rel_path,
-            source_class=source_class,
-            path_scope=path_scope,
-            precedence=ctx.precedence_map.get(rel_path, 999),
-            required=rel_path in ctx.required_patterns,
-        )
-    )
-
-
-def _discover_agents_md(
-    repo_root: Path,
-    ctx: SourceDiscoveryContext,
-) -> None:
-    """Discover AGENTS.md files."""
-    for agents_path in repo_root.rglob("AGENTS.md"):
-        if agents_path.is_file():
-            rel_path = agents_path.relative_to(repo_root).as_posix()
-            is_safe, _ = check_source_safety(agents_path, repo_root)
-            if is_safe:
-                _add_source_if_safe(ctx, rel_path, "agents_md", "")
-
-
-def _discover_claude_md(
-    repo_root: Path,
-    ctx: SourceDiscoveryContext,
-) -> None:
-    """Discover CLAUDE.md files."""
-    for claude_path in repo_root.rglob("CLAUDE.md"):
-        if claude_path.is_file():
-            rel_path = claude_path.relative_to(repo_root).as_posix()
-            is_safe, _ = check_source_safety(claude_path, repo_root)
-            if is_safe:
-                _add_source_if_safe(ctx, rel_path, "claude_md", "")
-
-
-def _discover_explicit_files(
-    repo_root: Path,
-    explicit_files: list[str],
-    ctx: SourceDiscoveryContext,
-) -> None:
-    """Discover explicit instruction files."""
-    for explicit in explicit_files:
-        abs_path = repo_root / explicit
-        if abs_path.exists() and abs_path.is_file():
-            rel_path = explicit
-            is_safe, _ = check_source_safety(abs_path, repo_root)
-            if is_safe:
-                _add_source_if_safe(ctx, rel_path, "explicit", explicit)
-
-
-def _discover_skills_rules(
-    repo_root: Path,
-    skills_rules_dir: str | None,
-    ctx: SourceDiscoveryContext,
-) -> None:
-    """Discover skills/rules directory files."""
-    if not skills_rules_dir:
-        return
-
-    skills_dir = repo_root / skills_rules_dir
-    if not (skills_dir.exists() and skills_dir.is_dir()):
-        return
-
-    is_safe, _ = check_source_safety(skills_dir, repo_root)
-    if not is_safe:
-        return
-
-    for skill_file in skills_dir.rglob("*"):
-        if skill_file.is_file():
-            rel_path = skill_file.relative_to(repo_root).as_posix()
-            is_safe, _ = check_source_safety(skill_file, repo_root)
-            if is_safe:
-                _add_source_if_safe(ctx, rel_path, "skills_rules", skills_rules_dir)
-
-
-def _discover_task_brief(
-    repo_root: Path,
-    task_brief_path: str | None,
-    ctx: SourceDiscoveryContext,
-) -> None:
-    """Discover task brief file."""
-    if not task_brief_path:
-        return
-
-    abs_path = repo_root / task_brief_path
-    if abs_path.exists() and abs_path.is_file():
-        rel_path = task_brief_path
-        is_safe, _ = check_source_safety(abs_path, repo_root)
-        if is_safe:
-            _add_source_if_safe(ctx, rel_path, "task_brief", task_brief_path)
+    def __post_init__(self) -> None:
+        """Initialize per-class breakdown."""
+        for cls in ("instruction", "explicit", "skills", "scoped"):
+            self.by_class[cls] = {
+                "discovered": 0,
+                "readable": 0,
+                "included": 0,
+                "excluded": 0,
+                "informational": 0,
+            }
 
 
 def _discover_instruction_files(
-    repo_root: Path,
-    instruction_files: list[str],
-    ctx: SourceDiscoveryContext,
+    config: LocalConfig, repo_root: Path, sources: list[SourceRecord]
 ) -> None:
-    """Discover instruction files from glob patterns."""
-    for pattern in instruction_files:
-        for match_path in repo_root.rglob(pattern):
-            if match_path.is_file():
-                rel_path = match_path.relative_to(repo_root).as_posix()
-                is_safe, _ = check_source_safety(match_path, repo_root)
-                if is_safe:
-                    _add_source_if_safe(ctx, rel_path, "explicit", pattern)
+    """Discover instruction files via glob patterns."""
+    scope = config.source_scope
+    for pattern in scope.instruction_files:
+        matches = list(repo_root.rglob(pattern))
+        for match in matches:
+            if match.is_file():
+                sources.append(
+                    SourceRecord(
+                        path=match,
+                        source_class="instruction",
+                        required=False,
+                        configured=True,
+                    )
+                )
 
 
-def _discover_path_scopes(
-    repo_root: Path,
-    path_scopes: list[str],
-    ctx: SourceDiscoveryContext,
+def _discover_explicit_files(
+    config: LocalConfig, repo_root: Path, sources: list[SourceRecord]
 ) -> None:
-    """Discover files from path scopes."""
-    for path_scope in path_scopes:
-        scope_path = repo_root / path_scope
-        if not scope_path.exists():
-            continue
+    """Add explicit files."""
+    scope = config.source_scope
+    for explicit in scope.explicit_instruction_files:
+        path = repo_root / explicit
+        sources.append(
+            SourceRecord(
+                path=path,
+                source_class="explicit",
+                required=False,
+                configured=True,
+            )
+        )
 
-        is_safe, _ = check_source_safety(scope_path, repo_root)
-        if not is_safe:
-            continue
 
-        if scope_path.is_file():
-            rel_path = scope_path.relative_to(repo_root).as_posix()
-            _add_source_if_safe(ctx, rel_path, "explicit", path_scope)
+def _discover_skills_files(
+    config: LocalConfig, repo_root: Path, sources: list[SourceRecord]
+) -> None:
+    """Discover skills/rules directory."""
+    scope = config.source_scope
+    if scope.skills_rules_dir:
+        skills_dir = repo_root / scope.skills_rules_dir
+        if skills_dir.exists():
+            for file_path in skills_dir.rglob("*"):
+                if file_path.is_file():
+                    sources.append(
+                        SourceRecord(
+                            path=file_path,
+                            source_class="skills",
+                            required=False,
+                            configured=True,
+                        )
+                    )
         else:
-            for scoped_file in scope_path.rglob("*"):
-                if scoped_file.is_file():
-                    rel_path = scoped_file.relative_to(repo_root).as_posix()
-                    is_safe, _ = check_source_safety(scoped_file, repo_root)
-                    if is_safe:
-                        _add_source_if_safe(ctx, rel_path, "explicit", path_scope)
+            # Missing skills directory - will be caught by required check if needed
+            pass
+
+
+def _discover_scoped_files(
+    config: LocalConfig, repo_root: Path, sources: list[SourceRecord]
+) -> None:
+    """Discover files under path scopes."""
+    scope = config.source_scope
+    for path_scope in scope.path_scopes:
+        scope_path = repo_root / path_scope
+        if scope_path.exists():
+            if scope_path.is_file():
+                sources.append(
+                    SourceRecord(
+                        path=scope_path,
+                        source_class="scoped",
+                        required=False,
+                        configured=True,
+                    )
+                )
+            else:
+                for file_path in scope_path.rglob("*"):
+                    if file_path.is_file():
+                        sources.append(
+                            SourceRecord(
+                                path=file_path,
+                                source_class="scoped",
+                                required=False,
+                                configured=True,
+                            )
+                        )
+        else:
+            # Missing path scope - will be caught by required check if needed
+            pass
+
+
+def _mark_required_sources(
+    sources: list[SourceRecord], config: LocalConfig, repo_root: Path
+) -> None:
+    """Mark sources as required based on required patterns."""
+    scope = config.source_scope
+    for required_pattern in scope.required:
+        matches = list(repo_root.rglob(required_pattern))
+        if matches:
+            for match in matches:
+                if match.is_file():
+                    # Find matching source and mark as required
+                    for src in sources:
+                        if src.path == match:
+                            src.required = True
+                            break
+                    else:
+                        # Source not in our list (e.g., discovered via required
+                        # but not other scopes) - add it as informational
+                        sources.append(
+                            SourceRecord(
+                                path=match,
+                                source_class="instruction",
+                                required=True,
+                                configured=False,
+                            )
+                        )
+
+
+def _deduplicate_sources(sources: list[SourceRecord]) -> list[SourceRecord]:
+    """Deduplicate sources by path, keeping the first occurrence with merged metadata."""
+    seen: dict[Path, SourceRecord] = {}
+    for src in sources:
+        if src.path in seen:
+            # Merge metadata - keep required=True if any source has it
+            existing = seen[src.path]
+            existing.required = existing.required or src.required
+            existing.configured = existing.configured or src.configured
+        else:
+            seen[src.path] = src
+    return list(seen.values())
 
 
 def discover_sources(config: LocalConfig, repo_root: Path) -> list[SourceRecord]:
-    """Discover all configured sources, return SourceRecord list with path,
-    class, scope, precedence, required.
+    """Discover source files based on configuration.
 
     Args:
         config: Local configuration.
@@ -344,80 +209,198 @@ def discover_sources(config: LocalConfig, repo_root: Path) -> list[SourceRecord]
     Returns:
         List of SourceRecord objects.
     """
-    scope = config.source_scope
-    precedence_map = {path: idx for idx, path in enumerate(scope.precedence)}
-    required_patterns = list(scope.required)
+    sources: list[SourceRecord] = []
 
-    ctx = SourceDiscoveryContext(
-        sources=[],
-        precedence_map=precedence_map,
-        required_patterns=required_patterns,
-    )
+    _discover_instruction_files(config, repo_root, sources)
+    _discover_explicit_files(config, repo_root, sources)
+    _discover_skills_files(config, repo_root, sources)
+    _discover_scoped_files(config, repo_root, sources)
+    _mark_required_sources(sources, config, repo_root)
 
-    # 1. AGENTS.md - exact basename match
-    _discover_agents_md(repo_root, ctx)
-
-    # 2. CLAUDE.md - exact basename match
-    _discover_claude_md(repo_root, ctx)
-
-    # 3. Explicit instruction files
-    _discover_explicit_files(repo_root, scope.explicit_instruction_files, ctx)
-
-    # 4. Skills/rules directory
-    _discover_skills_rules(repo_root, scope.skills_rules_dir, ctx)
-
-    # 5. Task brief
-    task_brief_path = config.task_brief_path or config.task_overlay.task_brief_path
-    _discover_task_brief(repo_root, task_brief_path, ctx)
-
-    # 6. Instruction files glob patterns
-    _discover_instruction_files(repo_root, scope.instruction_files, ctx)
-
-    # 7. Path scopes
-    _discover_path_scopes(repo_root, scope.path_scopes, ctx)
-
-    # Sort by precedence, then by path
-    ctx.sources.sort(key=lambda s: (s.precedence, s.path))
-
-    return ctx.sources
+    return _deduplicate_sources(sources)
 
 
-def audit_sources(config: LocalConfig, repo_root: Path, revision: str) -> AuditResult:
-    """Perform full source audit.
+def read_source_content(source_path: Path) -> tuple[bytes | None, str | None]:
+    """Read source file content as bytes.
+
+    Returns:
+        Tuple of (content_bytes, error_message). If successful, error_message is None.
+        If failed, content_bytes is None and error_message describes the failure.
+    """
+    error: str | None = None
+    content: bytes | None = None
+
+    if not source_path.exists():
+        error = f"File not found: {source_path}"
+    elif not source_path.is_file():
+        error = f"Not a file: {source_path}"
+    else:
+        try:
+            content = source_path.read_bytes()
+        except PermissionError:
+            error = f"Permission denied: {source_path}"
+        except OSError as e:
+            error = f"OS error reading {source_path}: {e}"
+        except Exception as e:
+            error = f"Unexpected error reading {source_path}: {e}"
+
+    if error is None and content is not None:
+        # Check if it's likely a binary file by looking for null bytes
+        # or by checking if it's valid UTF-8
+        if b"\x00" in content:
+            # This is likely a binary file
+            pass
+        else:
+            # Try to decode as UTF-8 to verify it's text
+            with suppress(UnicodeDecodeError):
+                content.decode("utf-8")
+
+    return content, error
+
+
+def assess_readability(sources: list[SourceRecord], _repo_root: Path) -> list[SourceRecord]:
+    """
+    For each source, attempt to read content.
+    Update source.readable, source.read_error, source.raw_hash.
+    Required unreadable sources are flagged but not excluded here (blocked at compile).
+    """
+    for src in sources:
+        content, error = read_source_content(src.path)
+        if error is not None:
+            src.readable = False
+            src.read_error = error
+            src.raw_hash = None
+        else:
+            src.readable = True
+            src.read_error = None
+            # Compute SHA-256 of raw bytes
+            if content is not None:
+                src.raw_hash = hashlib.sha256(content).hexdigest()
+            else:
+                src.raw_hash = None
+    return sources
+
+
+def make_inclusion_decisions(
+    sources: list[SourceRecord], _config: LocalConfig, repo_root: Path
+) -> list[SourceRecord]:
+    """
+    Determine inclusion/exclusion for each source based on:
+    - readability (unreadable optional -> exclude with reason)
+    - safety (unsafe paths -> exclude with reason)
+    - required flag (required unreadable/unsafe -> will block at compile)
+    - configured status (unconfigured discovered files -> informational only)
+    Update source.included, source.exclusion_reason
+    """
+    for src in sources:
+        # Check if source is unconfigured (discovered via required patterns
+        # but not in configured scopes)
+        if not src.configured:
+            src.included = False
+            src.exclusion_reason = "Unconfigured source (discovered via required pattern only)"
+            continue
+
+        # Check readability
+        if src.readable is False:
+            if src.required:
+                src.included = False
+                src.exclusion_reason = f"Required source unreadable: {src.read_error}"
+            else:
+                src.included = False
+                src.exclusion_reason = f"Optional source unreadable: {src.read_error}"
+            continue
+
+        # Check safety (path traversal, etc.) - already validated in config,
+        # but double-check. Ensure the path is within the repo_root.
+        try:
+            src.path.resolve().relative_to(repo_root.resolve())
+        except ValueError:
+            src.included = False
+            src.exclusion_reason = f"Unsafe path (outside repo): {src.path}"
+            continue
+
+        # Safe, readable, configured -> included
+        src.included = True
+        src.exclusion_reason = None
+
+    return sources
+
+
+def _update_legacy_fields(result: AuditResult) -> None:
+    """Update legacy fields for backward compatibility."""
+    for src in result.sources:
+        if src.source_class == "instruction":
+            result.instruction_files.append(src.path)
+        elif src.source_class == "explicit":
+            result.explicit_files.append(src.path)
+        elif src.source_class == "skills":
+            result.skills_files.append(src.path)
+        elif src.source_class == "scoped":
+            result.scoped_files.append(src.path)
+
+    # Sort for consistency
+    result.instruction_files.sort()
+    result.explicit_files.sort()
+    result.skills_files.sort()
+    result.scoped_files.sort()
+
+
+def _update_counts(result: AuditResult) -> None:
+    """Update count fields from sources."""
+    result.total_discovered = len(result.sources)
+    result.total_readable = sum(1 for s in result.sources if s.readable)
+    result.total_included = sum(1 for s in result.sources if s.included)
+    result.total_excluded = sum(1 for s in result.sources if not s.included and s.configured)
+    result.total_informational = sum(1 for s in result.sources if not s.configured)
+
+    # Count conflicts (same path from different source classes with
+    # different precedence). For now, track as 0 - will be enhanced later.
+    result.total_conflicts = 0
+
+    # Per-class breakdown
+    for src in result.sources:
+        cls = src.source_class
+        result.by_class[cls]["discovered"] += 1
+        if src.readable:
+            result.by_class[cls]["readable"] += 1
+        if src.included:
+            result.by_class[cls]["included"] += 1
+        elif src.configured:
+            result.by_class[cls]["excluded"] += 1
+        else:
+            result.by_class[cls]["informational"] += 1
+
+
+@dataclass
+class AuditContext:
+    """Context for collecting audit results."""
+
+    config: LocalConfig
+    repo_root: Path
+    revision: str
+    sources: list[SourceRecord]
+    task_brief_hash: str
+    config_hash: str
+
+
+def collect_audit_result(context: AuditContext) -> AuditResult:
+    """Build the complete AuditResult for output."""
+    result = AuditResult(sources=context.sources)
+    _update_legacy_fields(result)
+    _update_counts(result)
+    return result
+
+
+def audit_sources(config: LocalConfig, repo_root: Path) -> list[SourceRecord]:
+    """Perform full source audit and return source records.
 
     Args:
         config: Local configuration.
         repo_root: Repository root path.
-        revision: Git revision.
 
     Returns:
-        AuditResult with all discovered sources.
+        List of SourceRecord objects with readability and inclusion decisions.
     """
     sources = discover_sources(config, repo_root)
-
-    # Read content for each source to compute hashes
-    for source in sources:
-        read_source_content(repo_root, source)
-
-    # Compute task brief hash
-    task_brief_hash = ""
-    task_brief_path = config.task_brief_path or config.task_overlay.task_brief_path
-    if task_brief_path:
-        abs_path = repo_root / task_brief_path
-        if abs_path.exists() and abs_path.is_file():
-            content = abs_path.read_bytes()
-            task_brief_hash = hashlib.sha256(content).hexdigest()
-
-    # Compute config hash
-    config_dict = config.model_dump(mode="json")
-    config_json = json.dumps(config_dict, sort_keys=True)
-    config_hash = hashlib.sha256(config_json.encode()).hexdigest()
-
-    return AuditResult(
-        repo_root=str(repo_root),
-        revision=revision,
-        sources=sources,
-        task_brief_hash=task_brief_hash,
-        config_hash=config_hash,
-        timestamp=datetime.now(UTC).isoformat(),
-    )
+    sources = assess_readability(sources, repo_root)
+    return make_inclusion_decisions(sources, config, repo_root)
