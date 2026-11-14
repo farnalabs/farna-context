@@ -1,0 +1,23 @@
+Bounded task for Farna Context POC dogfood proof:
+
+Objective: Add a new read-only endpoint `/api/v1/admin/audit/summary` to the Farna Control backend that returns a summary of audit events by type for the last 7 days.
+
+Scope:
+- Backend only (FastAPI route in src/farna/api)
+- Read-only SQL query against audit_events table
+- Returns JSON: { "total_events": int, "by_type": { "event_type": count } }
+- No authentication/authorization changes required (use existing admin dependency)
+- Must follow existing code patterns in src/farna/api/routes/admin.py
+
+Constraints:
+- No new database migrations
+- No schema changes
+- Reuse existing database session dependency
+- Follow existing error handling patterns
+- Include basic input validation (limit parameter, default 7 days)
+
+Acceptance:
+- Endpoint returns correct counts
+- Response matches expected schema
+- No regression in existing tests
+- Follows project code style (ruff, mypy)
