@@ -56,7 +56,7 @@ Thumbs.db
 
 # Project specific
 TRACKER.md
-.farna-context/
+.agents/
 
 # Logs
 *.log

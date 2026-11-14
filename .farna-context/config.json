@@ -1,49 +1,54 @@
 {
-  "repo_root": ".",
-  "revision": null,
-  "source_scope": {
+  "repo_root": "/home/dev/Modulo/Repos/modulo",
+  "revision": "auto",
+  "source_scope": "/home/dev/Modulo/Repos/modulo",
+  "harness_fixture": "opencode",
+  "task_brief_path": "/home/dev/Modulo/Repos/farna-context/task.txt",
+  "staging_parent": "/home/dev/Modulo/Repos/farna-context/context-staging",
+  "sources": {
     "instruction_files": [
-      "*.md",
-      "docs/**/*.md",
-      "AGENTS.md"
+      "AGENTS.md",
+      "CLAUDE.md"
     ],
     "explicit_instruction_files": [],
-    "skills_rules_dir": ".agents/skills",
-    "path_scopes": [
-      "src/",
-      "tests/"
-    ],
-    "precedence": [
-      "explicit",
-      "instruction",
-      "skills"
-    ],
-    "required": [
-      "README.md"
-    ]
+    "skills_rules_dir": "backend/scripts",
+    "path_scopes": {
+      "AGENTS.md": "/",
+      "CLAUDE.md": "/"
+    },
+    "precedence": {
+      "AGENTS.md": 100,
+      "CLAUDE.md": 90
+    },
+    "required": {
+      "AGENTS.md": true,
+      "CLAUDE.md": true
+    }
   },
-  "harness_fixture": "opencode",
-  "task_brief_path": null,
-  "staging_parent": ".farna-context/staging",
   "task_overlay": {
-    "task_brief_path": null,
-    "extra_sources": [],
-    "exclude_patterns": []
+    "allowed_overlay_fields": [],
+    "scope": "/"
   },
-  "output_files": {
-    "manifest": "manifest.yaml",
-    "context_pack": "context_pack.zip",
-    "receipt": "receipt.json"
-  },
+  "output_files": [
+    {
+      "path": "context/instructions.md",
+      "source": "pack.instructions"
+    },
+    {
+      "path": "context/task.txt",
+      "source": "pack.task"
+    }
+  ],
   "secret_patterns": {
-    "patterns": [
-      "(?i)(api[_-]?key|secret|token|password|passwd)\\s*[:=]\\s*['\"]?[a-zA-Z0-9_\\-]{20,}['\"]?",
-      "(?i)(aws[_-]?access[_-]?key|aws[_-]?secret[_-]?key)\\s*[:=]\\s*['\"]?[A-Z0-9]{20,}['\"]?",
-      "-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----",
-      "sk-[a-zA-Z0-9]{32,}",
-      "gh[pousr]_[a-zA-Z0-9]{36,}",
-      "xox[baprs]-[a-zA-Z0-9-]{10,}"
-    ],
-    "exclude_paths": []
+    "literal_values": [],
+    "named_detectors": [
+      "aws_access_key_id",
+      "aws_secret_access_key",
+      "github_token",
+      "slack_token",
+      "database_url",
+      "api_key",
+      "private_key"
+    ]
   }
 }
