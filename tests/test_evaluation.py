@@ -287,6 +287,21 @@ while cache_file.exists():
     assert all("validity" in record for record in records)
 
 
+def test_parent_sentinel_is_bounded_with_large_worktree_tree(tmp_path: Path) -> None:
+    parent = tmp_path / "parent"
+    (parent / "src").mkdir(parents=True)
+    (parent / "src" / "slugify.py").write_text("original", encoding="utf-8")
+    for index in range(200):
+        nested = parent / ".agents" / "worktrees" / f"tree-{index}" / "nested"
+        nested.mkdir(parents=True)
+        (nested / "large.bin").write_bytes(b"x" * 1000)
+    before = evaluation_runner._parent_evidence(parent)
+    assert before["file_count"] == 1
+    (parent / "src" / "slugify.py").write_text("changed", encoding="utf-8")
+    after = evaluation_runner._parent_evidence(parent)
+    assert before["tree_hash"] != after["tree_hash"]
+
+
 def test_parent_sentinel_excludes_nested_worktrees_and_hashes_product_files(tmp_path: Path) -> None:
     parent = tmp_path / "parent"
     (parent / "src").mkdir(parents=True)
@@ -295,7 +310,7 @@ def test_parent_sentinel_excludes_nested_worktrees_and_hashes_product_files(tmp_
     (parent / ".agents" / "worktrees" / "deep" / "nested" / "large.bin").write_bytes(b"x" * 1000)
     before = evaluation_runner._parent_evidence(parent)
     assert before["file_count"] == 1
-    assert before["sentinel_version"] == "parent-sentinel-v1"
+    assert before["sentinel_version"] == "parent-sentinel-v2"
     assert ".agents" in before["excluded_tree_parts"]
     (parent / "src" / "slugify.py").write_text("changed", encoding="utf-8")
     after = evaluation_runner._parent_evidence(parent)
