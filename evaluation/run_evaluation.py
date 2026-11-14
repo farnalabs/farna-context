@@ -104,7 +104,13 @@ _IGNORED_TREE_NAMES = {
     "context-pack.json",
 }
 _MAX_SNAPSHOT_ERRORS = 20
-_PARENT_SENTINEL_VERSION = "parent-sentinel-v1"
+_PARENT_SENTINEL_VERSION = "parent-sentinel-v2"
+_SETUP_BUDGET_SECONDS = 10.0
+_PARENT_SENTINEL_MAX_FILES = 10_000
+
+
+class _SentinelBudgetExceeded(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -254,38 +260,72 @@ def _snapshot_digest(snapshot: TreeSnapshot) -> str:
     return digest.hexdigest()
 
 
-def _git_output(root: Path, *arguments: str) -> str:
+def _git_output(root: Path, *arguments: str, timeout: float | None = None) -> str:
     completed = subprocess.run(
         ["git", "-C", str(root), *arguments],
         capture_output=True,
         text=True,
         check=True,
+        timeout=timeout,
     )
     return completed.stdout
 
 
-def _parent_sentinel_snapshot(root: Path) -> tuple[TreeSnapshot, str]:
-    """Hash parent product files without traversing evaluation worktrees/caches.
+def _parent_sentinel_snapshot(
+    root: Path, *, deadline: float | None = None
+) -> tuple[TreeSnapshot, str]:
+    """Hash only parent product files, never linked worktrees or transient trees.
 
-    Git supplies the bounded candidate set: tracked files plus ordinary untracked
-    files. The status digest catches deletions and metadata changes; file hashes
-    catch in-place edits that status alone cannot distinguish. Non-git roots use
-    the same explicit transient-directory exclusions as a test-only fallback.
+    Git supplies the candidate set without recursively walking ``.agents``. The
+    deadline and file cap make the sentinel fail closed instead of becoming an
+    unbounded pre-launch scan. Non-git roots use the same exclusions as a bounded
+    test-only fallback.
     """
     errors: list[str] = []
     hashes: dict[str, str] = {}
+    remaining = None if deadline is None else max(0.01, deadline - time.monotonic())
     try:
-        status = _git_output(root, "status", "--short", "--untracked-files=all")
+        status = _git_output(root, "status", "--short", "--untracked-files=all", timeout=remaining)
+        remaining = None if deadline is None else max(0.01, deadline - time.monotonic())
         candidates = _git_output(
-            root, "ls-files", "--cached", "--others", "--exclude-standard"
+            root,
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            timeout=remaining,
         ).splitlines()
-        candidate_paths = [
-            root / relative for relative in candidates if not _is_ignored_relative(Path(relative))
+        candidates = [
+            relative for relative in candidates if not _is_ignored_relative(Path(relative))
         ]
-    except (OSError, subprocess.CalledProcessError):
+        if len(candidates) > _PARENT_SENTINEL_MAX_FILES:
+            raise _SentinelBudgetExceeded from None
+        candidate_paths = [root / relative for relative in candidates]
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        if isinstance(exc, subprocess.TimeoutExpired):
+            raise _SentinelBudgetExceeded from exc
         status = ""
-        candidate_paths = _tracked_tree_paths(root)
+        candidate_paths = []
+        for directory, directory_names, file_names in os.walk(root, followlinks=False):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise _SentinelBudgetExceeded from None
+            relative_directory = Path(directory).relative_to(root)
+            directory_names[:] = [
+                name
+                for name in directory_names
+                if not _is_ignored_relative(relative_directory / name)
+                and not (Path(directory) / name).is_symlink()
+            ]
+            candidate_paths.extend(
+                Path(directory) / name
+                for name in file_names
+                if not _is_ignored_relative(relative_directory / name)
+            )
+            if len(candidate_paths) > _PARENT_SENTINEL_MAX_FILES:
+                raise _SentinelBudgetExceeded from None
     for path in sorted(candidate_paths):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _SentinelBudgetExceeded from None
         relative_name = path.relative_to(root).as_posix()
         try:
             if path.is_symlink():
@@ -299,8 +339,8 @@ def _parent_sentinel_snapshot(root: Path) -> tuple[TreeSnapshot, str]:
     return TreeSnapshot(hashes=hashes, errors=tuple(errors)), status_hash
 
 
-def _parent_evidence(root: Path) -> dict[str, Any]:
-    snapshot, status_hash = _parent_sentinel_snapshot(root)
+def _parent_evidence(root: Path, *, deadline: float | None = None) -> dict[str, Any]:
+    snapshot, status_hash = _parent_sentinel_snapshot(root, deadline=deadline)
     evidence: dict[str, Any] = {
         "path": str(root),
         "accessible": not snapshot.errors,
@@ -574,6 +614,32 @@ def _run_oracle(checkout: Path, environment: dict[str, str]) -> tuple[bool, str]
     return completed.returncode == 0, summary
 
 
+def _setup_failure(error: str, *, launch_manifest: dict[str, Any] | None = None) -> ExecutionResult:
+    return ExecutionResult(
+        process_status="setup_error",
+        returncode=None,
+        stdout_summary="",
+        stderr_summary="",
+        elapsed_seconds=0.0,
+        provider_ok=False,
+        provider_failure_class=None,
+        oracle_passed=None,
+        oracle_summary="not_run:setup_invalidity",
+        changed_files=[],
+        runtime_artifacts=[],
+        scope_ok=False,
+        test_deletion_ok=False,
+        secret_output_ok=True,
+        contamination_ok=True,
+        contamination_evidence={"error": error},
+        prompt_sha256="",
+        setup_ok=False,
+        harness_ok=True,
+        guard_error=error,
+        launch_manifest=launch_manifest or {"error": error},
+    )
+
+
 def execute_attempt(  # noqa: PLR0913, PLR0915
     *,
     arm: str,
@@ -586,29 +652,7 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
     try:
         before = file_hashes(checkout)
     except OSError:
-        return ExecutionResult(
-            process_status="setup_error",
-            returncode=None,
-            stdout_summary="",
-            stderr_summary="",
-            elapsed_seconds=0.0,
-            provider_ok=False,
-            provider_failure_class=None,
-            oracle_passed=None,
-            oracle_summary="not_run:setup_invalidity",
-            changed_files=[],
-            runtime_artifacts=[],
-            scope_ok=False,
-            test_deletion_ok=False,
-            secret_output_ok=True,
-            contamination_ok=True,
-            contamination_evidence={"error": "checkout_snapshot_unstable"},
-            prompt_sha256="",
-            setup_ok=False,
-            harness_ok=True,
-            guard_error="checkout_snapshot_unstable",
-            launch_manifest={},
-        )
+        return _setup_failure("checkout_snapshot_unstable")
     directory_argument = _directory_argument(command)
     directory_error = (
         "directory_argument_missing"
@@ -644,7 +688,17 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
             },
         )
     parent_root = parent_repository_root()
-    parent_before = _parent_evidence(parent_root) if parent_root else {"accessible": False}
+    setup_deadline = time.monotonic() + _SETUP_BUDGET_SECONDS
+    try:
+        parent_before = (
+            _parent_evidence(parent_root, deadline=setup_deadline)
+            if parent_root
+            else {"accessible": False}
+        )
+    except _SentinelBudgetExceeded:
+        return _setup_failure(
+            "parent_sentinel_timeout", launch_manifest={"error": "parent_sentinel_timeout"}
+        )
     prompt = _prompt_for(arm, task, pack_path, checkout)
     prompt_path = checkout / ".evaluation-prompt.md"
     prompt_path.write_bytes(prompt)
@@ -697,7 +751,14 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
     changed, runtime_artifacts, scope_ok, deletion_ok, secret_ok, guard_error = _guardrail_results(
         before, checkout, output, error
     )
-    parent_after = _parent_evidence(parent_root) if parent_root else {"accessible": False}
+    try:
+        parent_after = (
+            _parent_evidence(parent_root, deadline=time.monotonic() + _SETUP_BUDGET_SECONDS)
+            if parent_root
+            else {"accessible": False}
+        )
+    except _SentinelBudgetExceeded:
+        parent_after = {"accessible": False, "error": "parent_sentinel_timeout"}
     contamination_ok = parent_before == parent_after and parent_after.get("accessible", False)
     setup_ok = guard_error is None
     harness_ok = True
@@ -920,58 +981,98 @@ def run_evaluation(  # noqa: PLR0913
     result_path = experiment_dir / "results.jsonl"
     records: list[dict[str, Any]] = []
     task_id = protocol["frozen_inputs"]["task_id"]
-    for assignment_index, (arm, attempt) in enumerate(assignment_order(repetitions), start=1):
-        with tempfile.TemporaryDirectory(prefix=f"evaluation-{arm}-{attempt}-") as temporary:
-            temporary_path = Path(temporary)
-            checkout = temporary_path / "checkout"
-            copy_fixture(fixture, checkout)
-            pack_hash: str | None = None
-            post_pack_hash: str | None = None
-            pack_path: Path | None = None
-            shadow_preflight: dict[str, Any] | None = None
-            if arm == "B":
-                pack_path = checkout / _SHADOW_DESTINATION
-                pack_hash, post_pack_hash, shadow_preflight = materialise_shadow(
-                    checkout, pack_path
-                )
-            command = [executable, "run", "--auto", "--format", "json", "--dir", str(checkout)]
+    try:
+        with result_path.open("w", encoding="utf-8") as result_file:
+            for assignment_index, (arm, attempt) in enumerate(
+                assignment_order(repetitions), start=1
+            ):
+                with tempfile.TemporaryDirectory(
+                    prefix=f"evaluation-{arm}-{attempt}-"
+                ) as temporary:
+                    temporary_path = Path(temporary)
+                    checkout = temporary_path / "checkout"
+                    copy_fixture(fixture, checkout)
+                    pack_hash: str | None = None
+                    post_pack_hash: str | None = None
+                    pack_path: Path | None = None
+                    shadow_preflight: dict[str, Any] | None = None
+                    if arm == "B":
+                        pack_path = checkout / _SHADOW_DESTINATION
+                        pack_hash, post_pack_hash, shadow_preflight = materialise_shadow(
+                            checkout, pack_path
+                        )
+                    command = [
+                        executable,
+                        "run",
+                        "--auto",
+                        "--format",
+                        "json",
+                        "--dir",
+                        str(checkout),
+                    ]
+                    if model != "UNSPECIFIED":
+                        command.extend(["--model", model])
+                    execution = (
+                        None
+                        if dry_run
+                        else execute_attempt(
+                            arm=arm,
+                            checkout=checkout,
+                            task=fixture.task.read_bytes(),
+                            pack_path=pack_path,
+                            command=command,
+                            timeout=int(protocol["runner"]["timeout_seconds"]),
+                        )
+                    )
+                    record = build_record(
+                        experiment_id=experiment_id,
+                        task_id=task_id,
+                        fixture=fixture,
+                        arm=arm,
+                        attempt=attempt,
+                        assignment_index=assignment_index,
+                        pack_hash=pack_hash,
+                        post_pack_hash=post_pack_hash,
+                        pack_path=pack_path,
+                        shadow_preflight=shadow_preflight,
+                        dry_run=dry_run,
+                        model=model,
+                        executable=executable,
+                        protocol=protocol,
+                        execution=execution,
+                    )
+                    records.append(record)
+                    result_file.write(json.dumps(record, sort_keys=True) + "\n")
+                    result_file.flush()
+                    os.fsync(result_file.fileno())
+    finally:
+        _write_summary(
+            experiment_dir=experiment_dir,
+            result_path=result_path,
+            experiment_id=experiment_id,
+            protocol=protocol,
+            fixture=fixture,
+            repetitions=repetitions,
+            dry_run=dry_run,
+            task_id=task_id,
+            records=records,
+        )
+    summary_path = experiment_dir / "summary.json"
+    return result_path, summary_path
 
-            if model != "UNSPECIFIED":
-                command.extend(["--model", model])
-            execution = (
-                None
-                if dry_run
-                else execute_attempt(
-                    arm=arm,
-                    checkout=checkout,
-                    task=fixture.task.read_bytes(),
-                    pack_path=pack_path,
-                    command=command,
-                    timeout=int(protocol["runner"]["timeout_seconds"]),
-                )
-            )
-            records.append(
-                build_record(
-                    experiment_id=experiment_id,
-                    task_id=task_id,
-                    fixture=fixture,
-                    arm=arm,
-                    attempt=attempt,
-                    assignment_index=assignment_index,
-                    pack_hash=pack_hash,
-                    post_pack_hash=post_pack_hash,
-                    pack_path=pack_path,
-                    shadow_preflight=shadow_preflight,
-                    dry_run=dry_run,
-                    model=model,
-                    executable=executable,
-                    protocol=protocol,
-                    execution=execution,
-                )
-            )
-    result_path.write_text(
-        "\n".join(json.dumps(record, sort_keys=True) for record in records) + "\n", encoding="utf-8"
-    )
+
+def _write_summary(  # noqa: PLR0913
+    *,
+    experiment_dir: Path,
+    result_path: Path,
+    experiment_id: str,
+    protocol: dict[str, Any],
+    fixture: Fixture,
+    repetitions: int,
+    dry_run: bool,
+    task_id: str,
+    records: list[dict[str, Any]],
+) -> None:  # noqa: PLR0913
     summary = {
         "experiment_id": experiment_id,
         "protocol_version": protocol["protocol_version"],
@@ -1003,7 +1104,6 @@ def run_evaluation(  # noqa: PLR0913
     }
     summary_path = experiment_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return result_path, summary_path
 
 
 def main() -> int:
