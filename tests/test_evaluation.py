@@ -231,22 +231,26 @@ def test_parent_sentinel_excludes_nested_worktrees_and_hashes_product_files(tmp_
 
 
 def test_fake_process_cannot_contaminate_parent_checkout(tmp_path: Path, monkeypatch) -> None:
-    parent = tmp_path / "parent"
-    parent.mkdir()
-    marker = parent / "parent-marker.txt"
+    sentinel_parent = tmp_path / "sentinel-parent"
+    sentinel_parent.mkdir()
+    marker = sentinel_parent / "parent-marker.txt"
     marker.write_text("before", encoding="utf-8")
-    checkout = tmp_path / "checkout"
+    checkout = tmp_path / "isolated-checkout"
     checkout.mkdir()
+    attempted_parent_write = sentinel_parent / "unexpected.txt"
+    repository_marker = ROOT / "cwd-marker.txt"
+    assert not repository_marker.exists()
     executable = _fake_executable(
         tmp_path,
-        """
+        f"""
 from pathlib import Path
 import os
-Path('cwd-marker.txt').write_text(os.getcwd(), encoding='utf-8')
-Path.cwd().parent.joinpath('parent', 'unexpected.txt').write_text('bad', encoding='utf-8')
+if "--version" not in os.sys.argv:
+    Path('cwd-marker.txt').write_text(os.getcwd(), encoding='utf-8')
+    Path({str(attempted_parent_write)!r}).write_text('bad', encoding='utf-8')
 """,
     )
-    monkeypatch.setattr(evaluation_runner, "parent_repository_root", lambda: parent)
+    monkeypatch.setattr(evaluation_runner, "parent_repository_root", lambda: sentinel_parent)
     result = evaluation_runner.execute_attempt(
         arm="A",
         checkout=checkout,
@@ -256,7 +260,19 @@ Path.cwd().parent.joinpath('parent', 'unexpected.txt').write_text('bad', encodin
         timeout=30,
     )
     assert (checkout / "cwd-marker.txt").read_text(encoding="utf-8") == str(checkout)
+    assert attempted_parent_write.read_text(encoding="utf-8") == "bad"
     assert result.contamination_ok is False
+    assert (
+        classify_attempt(
+            setup_ok=result.setup_ok,
+            harness_ok=result.harness_ok,
+            contamination_ok=result.contamination_ok,
+            provider_ok=result.provider_ok,
+            outcome="failure",
+        )
+        == "contamination_invalidity"
+    )
+    assert not repository_marker.exists()
     assert result.launch_manifest["argv"][1] == "<checkout>"
     assert result.launch_manifest["cwd"] == "<checkout>"
     assert result.launch_manifest["environment"]["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
