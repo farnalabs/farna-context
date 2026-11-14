@@ -206,6 +206,12 @@ def test_unexpected_file_scope_fails_even_with_passing_oracle(tmp_path: Path) ->
         tmp_path,
         """
 from pathlib import Path
+import sys
+
+if sys.argv[1:] == ['--version']:
+    print('fake-opencode 1.0')
+    raise SystemExit(0)
+
 Path('src/slugify.py').write_text(
     'import re\\n\\n\\ndef slugify(value: str) -> str:\\n'
     '    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")\\n',
