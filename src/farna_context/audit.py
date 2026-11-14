@@ -24,6 +24,38 @@ _SOURCE_CLASS_NAMES = {
     "scoped": "scoped",
 }
 
+_GENERATED_DIRECTORY_NAMES = frozenset(
+    {
+        "__pycache__",
+        ".eggs",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "build",
+        "dist",
+        "downloads",
+        "develop-eggs",
+        "eggs",
+        "htmlcov",
+        "parts",
+        "sdist",
+        "var",
+        "wheels",
+    }
+)
+_GENERATED_FILE_NAMES = frozenset({".Python", ".coverage", ".installed.cfg"})
+_GENERATED_FILE_SUFFIXES = (".egg", ".egg-info", ".pyc", ".pyo")
+_GENERATED_ARTIFACT_REASON = "Generated artifact excluded (bytecode, cache, or packaging output)"
+
+
+def generated_artifact_reason(path: Path) -> str | None:
+    """Return a stable exclusion reason for generated repository artifacts."""
+    if any(component in _GENERATED_DIRECTORY_NAMES for component in path.parts):
+        return _GENERATED_ARTIFACT_REASON
+    if path.name in _GENERATED_FILE_NAMES or path.name.endswith(_GENERATED_FILE_SUFFIXES):
+        return _GENERATED_ARTIFACT_REASON
+    return None
+
 
 @dataclass
 class SourceRecord:
@@ -118,6 +150,24 @@ def _discover_explicit_files(
         )
 
 
+def _append_discovered_file(
+    path: Path,
+    source_class: SourceClass,
+    sources: list[SourceRecord],
+) -> None:
+    """Record a discovered file, retaining generated artifacts as exclusions."""
+    reason = generated_artifact_reason(path)
+    sources.append(
+        SourceRecord(
+            path=path,
+            source_class=source_class,
+            required=False,
+            configured=True,
+            exclusion_reason=reason,
+        )
+    )
+
+
 def _discover_skills_files(
     config: LocalConfig, repo_root: Path, sources: list[SourceRecord]
 ) -> None:
@@ -128,14 +178,7 @@ def _discover_skills_files(
         if skills_dir.exists():
             for file_path in skills_dir.rglob("*"):
                 if file_path.is_file():
-                    sources.append(
-                        SourceRecord(
-                            path=file_path,
-                            source_class="skills",
-                            required=False,
-                            configured=True,
-                        )
-                    )
+                    _append_discovered_file(file_path, "skills", sources)
         else:
             # Missing skills directory - will be caught by required check if needed
             pass
@@ -315,6 +358,12 @@ def make_inclusion_decisions(
         if not src.configured:
             src.included = False
             src.exclusion_reason = "Unconfigured source (discovered via required pattern only)"
+            continue
+
+        generated_reason = generated_artifact_reason(src.path)
+        if generated_reason is not None:
+            src.included = False
+            src.exclusion_reason = generated_reason
             continue
 
         # Check readability

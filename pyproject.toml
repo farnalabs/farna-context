@@ -12,6 +12,9 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.scripts]
+farna-context = "farna_context.cli:app"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2",

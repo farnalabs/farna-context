@@ -100,6 +100,38 @@ def test_required_excluded_source_blocks(tmp_path: Path) -> None:
         compile_manifest(manifest, tmp_path / "pack.json", config)
 
 
+def test_generated_bytecode_is_omitted_without_embedding(tmp_path: Path) -> None:
+    manifest, config, _source = _fixture(tmp_path)
+    generated = tmp_path / "repo" / "backend" / "scripts" / "skills" / "__pycache__"
+    generated.mkdir(parents=True)
+    bytecode = generated / "rule.cpython-312.pyc"
+    bytecode.write_bytes(b"not source")
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["sources"].append(
+        {
+            "path": "backend/scripts/skills/__pycache__/rule.cpython-312.pyc",
+            "included": True,
+            "required": False,
+            "source_class": "skills_rules",
+        }
+    )
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+
+    pack = compile_manifest(manifest, tmp_path / "pack.json", config)
+
+    assert not any(
+        source["path"].endswith("rule.cpython-312.pyc")
+        for source in pack.payload["selected_sources"]
+    )
+    omitted = next(
+        source
+        for source in pack.payload["omitted_sources"]
+        if source["path"].endswith("rule.cpython-312.pyc")
+    )
+    assert omitted["reason"] == "Generated artifact excluded (bytecode, cache, or packaging output)"
+    assert "not source" not in json.dumps(pack.payload)
+
+
 def test_secret_source_is_omitted_without_raw_hash(tmp_path: Path) -> None:
     manifest, config, source = _fixture(tmp_path, secret=True)
     source.write_bytes(b"literal-secret\n")

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .audit import generated_artifact_reason
 from .config import SecretPatterns
 from .exceptions import (
     InputChangedError,
@@ -154,6 +155,10 @@ def compile_manifest(  # noqa: PLR0912, PLR0915
     selected: list[dict[str, Any]] = []
     for record in _records(manifest):
         path = validate_relative_path(str(record["path"]))
+        generated_reason = generated_artifact_reason(Path(path))
+        if generated_reason is not None:
+            omissions.append({"path": path, "reason": generated_reason})
+            continue
         required = bool(record.get("required", False))
         if record.get("included") is not True:
             if required:

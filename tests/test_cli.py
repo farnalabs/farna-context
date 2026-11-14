@@ -4,9 +4,12 @@ import json
 from pathlib import Path
 
 import pytest
+from git import Repo
 from typer.testing import CliRunner
 
+from src.farna_context.audit import audit_sources
 from src.farna_context.cli import app
+from src.farna_context.config import LocalConfig, SourceScope
 from src.farna_context.constants import ExitCode
 
 
@@ -23,6 +26,46 @@ def _inputs(tmp_path: Path, source: bytes = b"safe\n") -> tuple[Path, Path, Path
         encoding="utf-8",
     )
     return manifest, config, tmp_path / "pack.json"
+
+
+def test_generated_bytecode_is_not_discovered_in_skills_directory(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    skills = repo / "backend" / "scripts" / "skills"
+    (skills / "__pycache__").mkdir(parents=True)
+    (skills / "rule.md").write_text("safe", encoding="utf-8")
+    (skills / "__pycache__" / "rule.cpython-312.pyc").write_bytes(b"bytecode")
+    git_repo = Repo.init(repo)
+    (repo / "README.md").write_text("fixture", encoding="utf-8")
+    git_repo.index.add(["README.md"])
+    git_repo.index.commit("fixture")
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "repo_root": str(repo),
+                "source_scope": {"skills_rules_dir": "backend/scripts"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["secrets", "--config", str(config)])
+    sources = audit_sources(
+        LocalConfig(source_scope=SourceScope(skills_rules_dir="backend/scripts")), repo
+    )
+
+    assert result.exit_code == 0
+    assert "No secrets found in 1 files" in result.stdout
+    assert [source.path for source in sources if source.included] == [skills / "rule.md"]
+    excluded = next(
+        source
+        for source in sources
+        if source.path == skills / "__pycache__" / "rule.cpython-312.pyc"
+    )
+    assert (
+        excluded.exclusion_reason
+        == "Generated artifact excluded (bytecode, cache, or packaging output)"
+    )
 
 
 def test_secrets_scans_non_instruction_sources(
@@ -56,6 +99,13 @@ def test_secrets_scans_non_instruction_sources(
     assert result.exit_code == int(ExitCode.SECRET_DETECTED)
     assert "api_key" in result.stdout
     assert "hidden" not in result.stdout
+
+
+def test_help_lists_commands() -> None:
+    result = CliRunner().invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "farna-context" in result.stdout
+    assert "compile" in result.stdout
 
 
 def test_compile_command_writes_pack(tmp_path: Path) -> None:
