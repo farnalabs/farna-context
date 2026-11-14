@@ -22,9 +22,10 @@ from .exceptions import (
 )
 from .git import GitError, check_dirty_tree, get_repo_root, get_revision
 from .manifest import generate_manifest, run_manifest
-from .materialise import materialise_files, materialise_to_stdout
+from .materialise import materialise_files, materialise_pack, materialise_to_stdout
 from .receipt import generate_receipt
 from .secrets import scan_sources
+from .utils import atomic_write_bytes, canonical_json_bytes
 from .verify import verify_all
 
 app = typer.Typer(
@@ -283,55 +284,62 @@ def compile(
 
 
 @app.command()
-def materialise(
+def materialise(  # noqa: PLR0913, PLR0917
+    pack: Annotated[Path | None, typer.Option("--pack", help="Compiled context pack JSON")] = None,
+    parent: Annotated[
+        Path | None, typer.Option("--parent", help="Staging parent directory")
+    ] = None,
+    out: Annotated[Path | None, typer.Option("--out", help="Materialisation plan JSON")] = None,
     config_path: Annotated[
-        Path | None, typer.Option("--config", "-c", help="Path to config file")
+        Path | None, typer.Option("--config", "-c", help="Legacy config path")
     ] = None,
     output_dir: Annotated[
-        Path | None, typer.Option("--output-dir", "-d", help="Output directory")
+        Path | None, typer.Option("--output-dir", "-d", help="Legacy output directory")
     ] = None,
     mode: Annotated[str, typer.Option("--mode", "-m", help="Materialisation mode")] = "files",
 ) -> None:
-    """Materialise source files to output directory or stdout."""
+    """Materialise a compiled pack using the signed-off pack/parent/out contract."""
     try:
+        if pack is not None or parent is not None or out is not None:
+            if pack is None or parent is None or out is None:
+                _exit_with_error(ExitCode.INVALID_ARGS)
+            assert pack is not None
+            assert parent is not None
+            assert out is not None
+            plan = materialise_pack(pack, parent, out)
+            console.print(
+                f"[green]Materialised {len(plan['outputs'])} files to {plan['output_dir']}[/green]"
+            )
+            return
         config, repo_root = _get_config_and_repo(config_path)
         revision = get_revision(repo_root)
-
         sources = audit_sources(config, repo_root)
-        audit_context = AuditContext(
-            config=config,
-            repo_root=repo_root,
-            revision=revision,
-            sources=sources,
-            task_brief_hash="",
-            config_hash="",
+        audit_result = collect_audit_result(
+            AuditContext(
+                config=config,
+                repo_root=repo_root,
+                revision=revision,
+                sources=sources,
+                task_brief_hash="",
+                config_hash="",
+            )
         )
-        audit_result = collect_audit_result(audit_context)
-
         if mode == "stdout":
-            output = materialise_to_stdout(config, audit_result, repo_root)
-            console.print(output)
-        else:
-            out_dir = output_dir or Path(config.staging_parent) / "materialised"
-            result = materialise_files(config, audit_result, repo_root, out_dir, mode)
-
-            msg = f"[green]Materialised {len(result.written_files)} files to {out_dir}[/green]"
-            console.print(msg)
-
-            if result.errors:
-                console.print("[yellow]Errors:[/yellow]")
-                for e in result.errors:
-                    console.print(f"  {e}")
-                _exit_with_error(ExitCode.WRITE_ERROR)
-
+            console.print(materialise_to_stdout(config, audit_result, repo_root))
+            return
+        out_dir = output_dir or Path(config.staging_parent) / "materialised"
+        result = materialise_files(config, audit_result, repo_root, out_dir, mode)
+        console.print(f"[green]Materialised {len(result.written_files)} files to {out_dir}[/green]")
+        if result.errors:
+            for error in result.errors:
+                console.print(f"  {error}")
+            _exit_with_error(ExitCode.WRITE_ERROR)
     except typer.Exit:
         raise
     except ValueError as e:
-        if str(e) == "Unsafe output path":
-            console.print(f"[red]Error: {e}[/red]")
-            _exit_with_error(ExitCode.DESTINATION_ERROR)
+        code = ExitCode.DESTINATION_ERROR if "Unsafe" in str(e) else ExitCode.COMPILATION_ERROR
         console.print(f"[red]Error: {e}[/red]")
-        _exit_with_error(ExitCode.COMPILATION_ERROR)
+        _exit_with_error(code)
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
         _exit_with_error(ExitCode.COMPILATION_ERROR)
@@ -350,12 +358,24 @@ def verify(
     ],
     output: Annotated[
         Path,
-        typer.Option("--out", "--output", "-o", help="Existing pack or materialisation directory"),
+        typer.Option("--out", "--output", "-o", help="Existing pack or materialisation path"),
     ],
 ) -> None:
     """Verify an existing materialisation plan and output without writing."""
     try:
         result = verify_all(plan, output)
+        if output.suffix.lower() == ".json" and not output.exists():
+            output.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(
+                output,
+                canonical_json_bytes(
+                    {
+                        "verified": result.verified,
+                        "mismatches": result.mismatches,
+                        "errors": result.errors,
+                    }
+                ),
+            )
 
         if result.verified:
             console.print("[green]All verifications passed[/green]")
