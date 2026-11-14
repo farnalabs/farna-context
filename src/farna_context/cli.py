@@ -259,6 +259,12 @@ def materialise(
                 for e in result.errors:
                     console.print(f"  {e}")
 
+    except ValueError as e:
+        if str(e) == "Unsafe output path":
+            console.print(f"[red]Error: {e}[/red]")
+            _exit_with_error(ExitCode.DESTINATION_ERROR)
+        console.print(f"[red]Error: {e}[/red]")
+        _exit_with_error(ExitCode.COMPILATION_ERROR)
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
         _exit_with_error(ExitCode.COMPILATION_ERROR)

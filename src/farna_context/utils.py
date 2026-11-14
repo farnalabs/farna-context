@@ -105,6 +105,29 @@ def identity_payload(value: dict[str, Any], hash_field: str) -> dict[str, Any]:
     return {key: item for key, item in value.items() if key != hash_field}
 
 
+def _validate_existing_directory_components(path: Path) -> None:
+    """Reject reparse points and non-directories among existing path components."""
+    current = Path(path.anchor) if path.anchor else Path()
+    parts = path.parts[1:] if path.anchor else path.parts
+    for component in parts:
+        current /= component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return
+        if _is_reparse_point(current) or not stat.S_ISDIR(info.st_mode):
+            raise ValueError("Unsafe output path")  # noqa: TRY003
+
+
+def prepare_output_directory(output_dir: Path) -> None:
+    """Create an output directory only after validating its existing path."""
+    _validate_existing_directory_components(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _validate_existing_directory_components(output_dir)
+    if _is_reparse_point(output_dir) or not output_dir.is_dir():
+        raise ValueError("Unsafe output path")  # noqa: TRY003
+
+
 def _validate_output_parent(output_path: Path) -> None:
     """Reject missing or reparse-point parent components without following them."""
     parent = output_path.parent

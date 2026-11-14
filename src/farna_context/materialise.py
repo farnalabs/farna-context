@@ -1,11 +1,16 @@
 """File emitter adapter for Farna Context."""
 
-import shutil
 from pathlib import Path
 
 from .audit import AuditResult
 from .config import LocalConfig
 from .manifest import generate_manifest
+from .utils import (
+    atomic_write_bytes,
+    prepare_output_directory,
+    safe_source_path,
+    validate_relative_path,
+)
 
 
 class MaterialiseResult:
@@ -37,7 +42,7 @@ def materialise_files(
     """
     _ = mode  # Unused for now, kept for API compatibility
     result = MaterialiseResult()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    prepare_output_directory(output_dir)
 
     all_files = (
         list(audit.instruction_files)
@@ -49,9 +54,11 @@ def materialise_files(
     for file_path in all_files:
         try:
             rel_path = file_path.relative_to(repo_root)
-            dest_path = output_dir / rel_path
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(file_path, dest_path)
+            relative = validate_relative_path(rel_path)
+            source_path = safe_source_path(repo_root, relative)
+            dest_path = output_dir / relative
+            prepare_output_directory(dest_path.parent)
+            atomic_write_bytes(dest_path, source_path.read_bytes())
             result.written_files.append(dest_path)
         except (ValueError, OSError) as e:
             result.errors.append(f"Failed to copy {file_path}: {e}")
@@ -59,8 +66,9 @@ def materialise_files(
     # Also write manifest
     try:
         manifest = generate_manifest(config, audit, repo_root, "HEAD")
-        manifest_path = output_dir / config.output_files.manifest
-        manifest.save(manifest_path)
+        manifest_path = output_dir / validate_relative_path(config.output_files.manifest)
+        prepare_output_directory(manifest_path.parent)
+        atomic_write_bytes(manifest_path, manifest.to_json().encode("utf-8"))
         result.written_files.append(manifest_path)
     except Exception as e:
         result.errors.append(f"Failed to write manifest: {e}")
