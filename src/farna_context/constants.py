@@ -3,26 +3,29 @@
 from enum import Enum, StrEnum
 
 
-# Exit codes
 class ExitCode(int, Enum):
-    """Process exit codes."""
+    """Stable command exit codes."""
 
     OK = 0
     INVALID_ARGS = 2
-    CONFIG_ERROR = 3
+    CONFIG_ERROR = 2
     GIT_ERROR = 4
+    REQUIRED_ISSUE = 10
+    INPUT_CHANGED = 11
+    SECRET_DETECTED = 12
+    DESTINATION_ERROR = 13
+    WRITE_ERROR = 14
+    VERIFICATION_ERROR = 15
+    RECEIPT_ERROR = 16
     REPO_NOT_FOUND = 10
     DIRTY_TREE = 11
     SCOPE_VIOLATION = 12
-    SECRET_DETECTED = 13
-    MANIFEST_ERROR = 14
-    COMPILATION_ERROR = 15
-    VERIFICATION_ERROR = 16
+    MANIFEST_ERROR = 2
+    COMPILATION_ERROR = 10
 
 
-# Receipt enums
 class RequestedBy(StrEnum):
-    """Who/what requested the operation."""
+    """Who requested the operation."""
 
     HUMAN = "human"
     AGENT = "agent"
@@ -31,7 +34,7 @@ class RequestedBy(StrEnum):
 
 
 class MaterialisationMode(StrEnum):
-    """How the context was materialised."""
+    """How context is materialised."""
 
     FILES = "files"
     STDIN = "stdin"
@@ -40,7 +43,7 @@ class MaterialisationMode(StrEnum):
 
 
 class HarnessLoadMode(StrEnum):
-    """How the harness was loaded."""
+    """Harness load mode."""
 
     IMPORT = "import"
     SUBPROCESS = "subprocess"
@@ -49,7 +52,7 @@ class HarnessLoadMode(StrEnum):
 
 
 class ModelUseMode(StrEnum):
-    """How the model was used."""
+    """Model use mode."""
 
     SYNC = "sync"
     ASYNC = "async"
@@ -58,7 +61,7 @@ class ModelUseMode(StrEnum):
 
 
 class OutcomeStatus(StrEnum):
-    """Outcome of the operation."""
+    """Outcome state."""
 
     SUCCESS = "success"
     FAILURE = "failure"
@@ -67,20 +70,18 @@ class OutcomeStatus(StrEnum):
 
 
 class EvidenceOrigin(StrEnum):
-    """Origin of evidence in receipt."""
+    """Evidence provenance."""
 
     DIRECT = "direct"
     DERIVED = "derived"
     OBSERVED = "observed"
     SELF_REPORTED = "self_reported"
+    REPORTED = "reported"
+    UNOBSERVED = "unobserved"
 
 
-# Fixture constants
 HARNESS_FIXTURE = "opencode"
-
-
-# File names
 CONFIG_FILE = ".farna-context/config.json"
-MANIFEST_FILE = "manifest.yaml"
-CONTEXT_PACK_FILE = "context_pack.zip"
+MANIFEST_FILE = "manifest.json"
+CONTEXT_PACK_FILE = "pack.json"
 RECEIPT_FILE = "receipt.json"

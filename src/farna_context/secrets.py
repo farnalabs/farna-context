@@ -1,142 +1,83 @@
-"""Secret pattern scanning for Farna Context."""
+"""Explicit, deterministic secret-pattern scanning."""
 
-import re
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .audit import AuditResult
 from .config import SecretPatterns
 
 
+@dataclass(frozen=True)
 class SecretFinding:
-    """A secret finding in a file."""
+    """A non-sensitive description of a matched pattern."""
 
-    def __init__(
-        self,
-        file_path: Path,
-        line_number: int,
-        pattern: str,
-        matched_text: str,
-        context: str = "",
-    ) -> None:
-        self.file_path = file_path
-        self.line_number = line_number
-        self.pattern = pattern
-        self.matched_text = matched_text
-        self.context = context
+    path: str
+    detector: str
+    line: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary."""
-        return {
-            "file": str(self.file_path),
-            "line": self.line_number,
-            "pattern": self.pattern,
-            "matched_text": self.matched_text[:100],  # Truncate for safety
-            "context": self.context[:200],
-        }
+        """Serialise without the matched secret value."""
+        result: dict[str, Any] = {"path": self.path, "detector": self.detector}
+        if self.line is not None:
+            result["line"] = self.line
+        return result
 
 
+@dataclass
 class SecretScanResult:
-    """Result of secret scanning."""
+    """Secret scan result."""
 
-    def __init__(self) -> None:
-        self.findings: list[SecretFinding] = []
-        self.scanned_files: int = 0
-        self.errors: list[str] = []
+    findings: list[SecretFinding] = field(default_factory=list)
+    scanned_files: int = 0
+    errors: list[str] = field(default_factory=list)
 
     def has_secrets(self) -> bool:
-        """Check if any secrets were found."""
-        return len(self.findings) > 0
+        """Whether a configured detector matched."""
+        return bool(self.findings)
 
 
-def scan_file(file_path: Path, patterns: SecretPatterns) -> list[SecretFinding]:
-    """Scan a single file for secrets.
+DETECTORS: dict[str, bytes] = {
+    "aws_access_key_id": b"AKIA",
+    "aws_secret_access_key": b"aws_secret_access_key",
+    "github_token": b"ghp_",
+    "slack_token": b"xoxb-",
+    "database_url": b"postgresql://",
+    "api_key": b"api_key",
+    "private_key": b"-----BEGIN ",
+}
 
-    Args:
-        file_path: Path to file to scan.
-        patterns: Secret patterns configuration.
 
-    Returns:
-        List of SecretFinding objects.
-    """
+def _literal_findings(data: bytes, path: str, literals: list[str]) -> list[SecretFinding]:
     findings: list[SecretFinding] = []
-
-    try:
-        content = file_path.read_text(encoding="utf-8", errors="ignore")
-    except (OSError, UnicodeDecodeError):
-        # Skip binary/unreadable files
-        return findings
-
-    lines = content.splitlines()
-    for line_num, line in enumerate(lines, 1):
-        for pattern in patterns.patterns:
-            try:
-                matches = re.finditer(pattern, line)
-                for match in matches:
-                    findings.append(
-                        SecretFinding(
-                            file_path=file_path,
-                            line_number=line_num,
-                            pattern=pattern,
-                            matched_text=match.group(0),
-                            context=line.strip(),
-                        )
-                    )
-            except re.error:
-                # Invalid regex pattern, skip
-                pass
-
+    for literal in literals:
+        if literal and literal.encode("utf-8") in data:
+            findings.append(SecretFinding(path, "configured_literal"))
     return findings
 
 
-def scan_sources(
-    audit_result: AuditResult,
-    patterns: SecretPatterns,
-    repo_root: Path,
-) -> SecretScanResult:
-    """Scan all source files for secrets.
+def scan_bytes(data: bytes, path: str, patterns: SecretPatterns) -> list[SecretFinding]:
+    """Scan bytes with only configured literals and fixed detector names."""
+    findings = _literal_findings(data, path, patterns.literal_values)
+    for name in patterns.named_detectors:
+        marker = DETECTORS.get(name)
+        if marker is None:
+            raise ValueError(f"Unknown secret detector: {name}")  # noqa: TRY003
+        if marker in data:
+            findings.append(SecretFinding(path, name))
+    return findings
 
-    Args:
-        audit_result: Audit results containing source files.
-        patterns: Secret patterns configuration.
-        repo_root: Repository root path.
 
-    Returns:
-        SecretScanResult with findings.
-    """
+def scan_file(file_path: Path, patterns: SecretPatterns) -> list[SecretFinding]:
+    """Scan one file without decoding or evaluating source bytes."""
+    return scan_bytes(file_path.read_bytes(), file_path.as_posix(), patterns)
+
+
+def scan_sources(sources: list[tuple[str, bytes]], patterns: SecretPatterns) -> SecretScanResult:
+    """Scan selected source bytes."""
     result = SecretScanResult()
-
-    all_files = (
-        list(audit_result.instruction_files)
-        + list(audit_result.explicit_files)
-        + list(audit_result.skills_files)
-        + list(audit_result.scoped_files)
-    )
-
-    # Build exclude set
-    exclude_set: set[Path] = set()
-    for exclude in patterns.exclude_paths:
-        exclude_path = repo_root / exclude
-        try:
-            if exclude_path.is_dir():
-                for f in exclude_path.rglob("*"):
-                    if f.is_file():
-                        exclude_set.add(f.resolve())
-            else:
-                exclude_set.add(exclude_path.resolve())
-        except (OSError, ValueError):
-            pass
-
-    for file_path in all_files:
-        try:
-            resolved = file_path.resolve()
-            if resolved in exclude_set:
-                continue
-
-            findings = scan_file(file_path, patterns)
-            result.findings.extend(findings)
-            result.scanned_files += 1
-        except Exception as e:
-            result.errors.append(f"Failed to scan {file_path}: {e}")
-
+    for path, data in sources:
+        result.scanned_files += 1
+        result.findings.extend(scan_bytes(data, path, patterns))
     return result

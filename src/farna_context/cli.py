@@ -7,9 +7,15 @@ import typer
 from rich.console import Console
 
 from .audit import AuditContext, audit_sources, collect_audit_result, run_audit
-from .compile import compile_context_pack
+from .compile import compile_manifest
 from .config import LocalConfig, load_config, save_config
 from .constants import CONFIG_FILE, ExitCode, OutcomeStatus, RequestedBy
+from .exceptions import (
+    CompilationError,
+    InputChangedError,
+    InvalidManifestError,
+    SecretDetectedError,
+)
 from .git import GitError, get_repo_root, get_revision
 from .manifest import generate_manifest, run_manifest
 from .materialise import materialise_files, materialise_to_stdout
@@ -167,38 +173,37 @@ def manifest(
 
 @app.command()
 def compile(
-    config_path: Annotated[
-        Path | None, typer.Option("--config", "-c", help="Path to config file")
+    manifest_path: Annotated[
+        Path | None, typer.Option("--manifest", help="Manifest JSON path")
     ] = None,
-    output: Annotated[Path | None, typer.Option("--output", "-o", help="Output file path")] = None,
+    output: Annotated[
+        Path | None, typer.Option("--out", "--output", "-o", help="Pack JSON path")
+    ] = None,
+    config_path: Annotated[
+        Path | None, typer.Option("--config", "-c", help="Config JSON path")
+    ] = None,
 ) -> None:
-    """Compile context pack from audited sources."""
+    """Compile a deterministic Context Pack from a manifest."""
     try:
-        config, repo_root = _get_config_and_repo(config_path)
-        revision = get_revision(repo_root)
-
-        sources = audit_sources(config, repo_root)
-        audit_context = AuditContext(
-            config=config,
-            repo_root=repo_root,
-            revision=revision,
-            sources=sources,
-            task_brief_hash="",
-            config_hash="",
-        )
-        audit_result = collect_audit_result(audit_context)
-        context_pack = compile_context_pack(config, audit_result, repo_root, revision)
-
-        output_path = output or Path(config.output_files.context_pack)
-        context_pack.create(output_path)
-
-        console.print(f"[green]Context pack written to {output_path}[/green]")
-        console.print(f"[bold]Size:[/bold] {context_pack.get_size()} bytes (approx)")
-
-    except GitError as e:
-        _handle_git_error(e)
-    except Exception as e:
-        _handle_generic_error(e, ExitCode.COMPILATION_ERROR)
+        if manifest_path is None:
+            _exit_with_error(ExitCode.INVALID_ARGS)
+        resolved_manifest = manifest_path
+        assert resolved_manifest is not None
+        output_path = output or resolved_manifest.with_name("pack.json")
+        pack = compile_manifest(resolved_manifest, output_path, config_path)
+        console.print(f"Context pack written to {output_path}")
+        console.print(f"Pack hash: {pack.pack_hash}")
+    except InputChangedError as exc:
+        console.print(str(exc))
+        _exit_with_error(ExitCode.INPUT_CHANGED)
+    except SecretDetectedError as exc:
+        console.print(str(exc))
+        _exit_with_error(ExitCode.SECRET_DETECTED)
+    except (InvalidManifestError, CompilationError) as exc:
+        console.print(f"Error: {exc}")
+        _exit_with_error(ExitCode.INVALID_ARGS)
+    except OSError as exc:
+        _handle_generic_error(exc, ExitCode.COMPILATION_ERROR)
 
 
 @app.command()
@@ -360,7 +365,8 @@ def secrets(
             config_hash="",
         )
         audit_result = collect_audit_result(audit_context)
-        result = scan_sources(audit_result, config.secret_patterns, repo_root)
+        source_bytes = [(str(path), path.read_bytes()) for path in audit_result.instruction_files]
+        result = scan_sources(source_bytes, config.secret_patterns)
 
         if result.has_secrets():
             console.print(
@@ -368,8 +374,7 @@ def secrets(
                 f"{result.scanned_files} files[/red]"
             )
             for finding in result.findings:
-                rel_path = finding.file_path.relative_to(repo_root)
-                console.print(f"  {rel_path}:{finding.line_number} - {finding.matched_text[:80]}")
+                console.print(f"  {finding.path} - {finding.detector}")
             _exit_with_error(ExitCode.SECRET_DETECTED)
 
         console.print(f"[green]No secrets found in {result.scanned_files} files[/green]")

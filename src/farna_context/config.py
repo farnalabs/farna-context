@@ -127,23 +127,12 @@ class OutputFiles(BaseModel):
 
 
 class SecretPatterns(BaseModel):
-    """Secret detection patterns."""
+    """Fixture-versioned literal values and named fixed detectors."""
 
-    patterns: list[str] = Field(
-        default_factory=lambda: [
-            r"(?i)(api[_-]?key|secret|token|password|passwd)\s*[:=]\s*['\"]?[a-zA-Z0-9_\-]{20,}['\"]?",
-            r"(?i)(aws[_-]?access[_-]?key|aws[_-]?secret[_-]?key)\s*[:=]\s*['\"]?[A-Z0-9]{20,}['\"]?",
-            r"-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----",
-            r"sk-[a-zA-Z0-9]{32,}",
-            r"gh[pousr]_[a-zA-Z0-9]{36,}",
-            r"xox[baprs]-[a-zA-Z0-9-]{10,}",
-        ],
-        description="Regex patterns for secret detection",
-    )
-    exclude_paths: list[str] = Field(
-        default_factory=list,
-        description="Paths to exclude from secret scanning",
-    )
+    literal_values: list[str] = Field(default_factory=list)
+    named_detectors: list[str] = Field(default_factory=list)
+    patterns: list[str] = Field(default_factory=list, description="Legacy field; not executed")
+    exclude_paths: list[str] = Field(default_factory=list)
 
     @field_validator("exclude_paths", mode="before")
     @classmethod
