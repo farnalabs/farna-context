@@ -127,8 +127,8 @@ import os
 import sys
 from pathlib import Path
 
-if len(sys.argv) < 3 or Path(sys.argv[1]) != Path.cwd():
-    raise SystemExit('project argument or cwd is not isolated')
+if sys.argv[1:7] != ['run', '--auto', '--format', 'json', '--dir', str(Path.cwd())]:
+    raise SystemExit('argv or cwd is not isolated')
 if os.environ.get('OPENCODE_DISABLE_PROJECT_CONFIG') != '1':
     raise SystemExit('project config was not disabled')
 prompt = sys.stdin.read()
@@ -165,7 +165,12 @@ print(json.dumps({'prompt_sha256': len(prompt)}))
     assert all(record["guardrails"]["status"] == "passed" for record in records)
     assert all(record["delivery_evidence"]["stderr_summary"] == "" for record in records)
     assert all(
-        record["delivery_evidence"]["launch_manifest"]["argv"][1] == "<checkout>"
+        record["delivery_evidence"]["launch_manifest"]["argv"]
+        == ["<executable>", "run", "--auto", "--format", "json", "--dir", "<checkout>"]
+        for record in records
+    )
+    assert all(
+        record["delivery_evidence"]["launch_manifest"]["directory_argument_option"] == "--dir"
         for record in records
     )
     assert all(
@@ -256,7 +261,7 @@ if "--version" not in os.sys.argv:
         checkout=checkout,
         task=b"work",
         pack_path=None,
-        command=[str(executable), str(checkout), "run"],
+        command=[str(executable), "run", "--auto", "--format", "json", "--dir", str(checkout)],
         timeout=30,
     )
     assert (checkout / "cwd-marker.txt").read_text(encoding="utf-8") == str(checkout)
@@ -273,7 +278,15 @@ if "--version" not in os.sys.argv:
         == "contamination_invalidity"
     )
     assert not repository_marker.exists()
-    assert result.launch_manifest["argv"][1] == "<checkout>"
+    assert result.launch_manifest["argv"] == [
+        "<executable>",
+        "run",
+        "--auto",
+        "--format",
+        "json",
+        "--dir",
+        "<checkout>",
+    ]
     assert result.launch_manifest["cwd"] == "<checkout>"
     assert result.launch_manifest["environment"]["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
     assert (
@@ -282,7 +295,7 @@ if "--version" not in os.sys.argv:
     )
 
 
-def test_project_argument_outside_checkout_is_setup_invalidity(tmp_path: Path) -> None:
+def test_directory_argument_outside_checkout_is_setup_invalidity(tmp_path: Path) -> None:
     executable = _fake_executable(tmp_path, "raise SystemExit('must not run')")
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -291,30 +304,30 @@ def test_project_argument_outside_checkout_is_setup_invalidity(tmp_path: Path) -
         checkout=checkout,
         task=b"work",
         pack_path=None,
-        command=[str(executable), str(tmp_path), "run"],
+        command=[str(executable), "run", "--dir", str(tmp_path)],
         timeout=30,
     )
     assert result.setup_ok is False
-    assert result.guard_error == "project_argument_outside_checkout"
+    assert result.guard_error == "directory_argument_outside_checkout"
     assert result.process_status == "setup_error"
 
 
-def test_project_argument_symlink_is_setup_invalidity(tmp_path: Path) -> None:
+def test_directory_argument_symlink_is_setup_invalidity(tmp_path: Path) -> None:
     executable = _fake_executable(tmp_path, "raise SystemExit('must not run')")
     checkout = tmp_path / "checkout"
     checkout.mkdir()
-    project_link = checkout / "project-link"
-    project_link.symlink_to(checkout, target_is_directory=True)
+    directory_link = checkout / "directory-link"
+    directory_link.symlink_to(checkout, target_is_directory=True)
     result = evaluation_runner.execute_attempt(
         arm="A",
         checkout=checkout,
         task=b"work",
         pack_path=None,
-        command=[str(executable), str(project_link), "run"],
+        command=[str(executable), "run", "--dir", str(directory_link)],
         timeout=30,
     )
     assert result.setup_ok is False
-    assert result.guard_error == "project_argument_symlink"
+    assert result.guard_error == "directory_argument_symlink"
     assert result.process_status == "setup_error"
 
 
