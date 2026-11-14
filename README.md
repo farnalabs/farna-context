@@ -19,6 +19,10 @@ uv sync --dev
 - `farna-context receipt` - Generate receipt
 - `farna-context secrets` - Scan for secrets
 
+## Alpha context types
+
+Context items are explicitly typed as `rule`, `general`, `artefact`, or `shadow_file`. Rules are scoped instructions; general context is bounded and unscoped; artefacts are opaque references rather than instructions; and shadow files are generated runtime materialisations, never authority sources. Shadow delivery requires the destination to already be ignored by Git, and cleanup is hash-aware: changed files are left untouched. This alpha model performs validation and preflight only; it does not write files, edit `.gitignore`, or store secret values.
+
 ## Alpha named-secret delivery contract
 
 The standalone `farna_context.secrets_broker` module defines the alpha contract for
