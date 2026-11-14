@@ -30,6 +30,15 @@ DEFAULT_TIMEOUT = 900
 ASSIGNMENT_SEED = 20261114
 _OUTPUT_LIMIT = 8000
 _ALLOWED_CHANGED_FILES = {"src/slugify.py", "tests/test_slugify.py"}
+_IGNORED_TREE_PARTS = {
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    ".venv",
+}
+_IGNORED_TREE_NAMES = {".evaluation-prompt.md", ".evaluation-pack", "context-pack.json"}
 _SECRET_PATTERNS = {
     "github_token": re.compile(rb"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
     "private_key": re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
@@ -60,6 +69,8 @@ class ExecutionResult:
     scope_ok: bool
     test_deletion_ok: bool
     secret_output_ok: bool
+    contamination_ok: bool
+    contamination_evidence: dict[str, Any]
     prompt_sha256: str
 
 
@@ -71,9 +82,19 @@ def sha256_file(path: Path) -> str:
     return sha256_bytes(path.read_bytes())
 
 
+def _tracked_tree_paths(root: Path) -> list[Path]:
+    return [
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and not any(part in _IGNORED_TREE_PARTS for part in path.relative_to(root).parts)
+        and not any(part in _IGNORED_TREE_NAMES for part in path.relative_to(root).parts)
+    ]
+
+
 def tree_hash(root: Path) -> str:
     digest = hashlib.sha256()
-    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+    for path in sorted(_tracked_tree_paths(root)):
         relative = path.relative_to(root).as_posix().encode()
         digest.update(relative)
         digest.update(b"\0")
@@ -84,14 +105,39 @@ def tree_hash(root: Path) -> str:
 
 def file_hashes(root: Path) -> dict[str, str]:
     return {
-        path.relative_to(root).as_posix(): sha256_file(path)
-        for path in root.rglob("*")
-        if path.is_file()
+        path.relative_to(root).as_posix(): sha256_file(path) for path in _tracked_tree_paths(root)
     }
+
+
+def _parent_evidence(root: Path) -> dict[str, Any]:
+    try:
+        return {"path": str(root), "accessible": True, "tree_hash": tree_hash(root)}
+    except OSError as exc:
+        return {"path": str(root), "accessible": False, "error": type(exc).__name__}
+
+
+def _changed_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    return sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
 
 
 def load_protocol() -> dict[str, Any]:
     return json.loads(PROTOCOL_PATH.read_text(encoding="utf-8"))
+
+
+def parent_repository_root() -> Path | None:
+    try:
+        common_dir = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    common_path = Path(common_dir)
+    if not common_path.is_absolute():
+        common_path = (ROOT / common_path).resolve()
+    return common_path.parent
 
 
 def synthetic_fixture() -> Fixture:
@@ -104,6 +150,9 @@ def copy_fixture(fixture: Fixture, destination: Path) -> None:
 
 
 def materialise_pack(checkout: Path, destination: Path) -> tuple[str, str]:
+    source_paths = [
+        path for path in _tracked_tree_paths(checkout) if destination not in path.parents
+    ]
     destination.mkdir(parents=True, exist_ok=True)
     source_hash = tree_hash(checkout)
     pack = {
@@ -112,7 +161,7 @@ def materialise_pack(checkout: Path, destination: Path) -> tuple[str, str]:
         "selected_files": [],
         "evidence_origin": "derived_from_local_fixture",
     }
-    for path in sorted(item for item in checkout.rglob("*") if item.is_file()):
+    for path in sorted(source_paths):
         relative = path.relative_to(checkout)
         if relative.parts[0] == ".git":
             continue
@@ -186,21 +235,27 @@ def _isolated_environment(root: Path) -> dict[str, str]:
     return environment
 
 
-def _prompt_for(arm: str, task: bytes, pack_path: Path | None) -> bytes:
+def _prompt_for(arm: str, task: bytes, pack_path: Path | None, checkout: Path) -> bytes:
+    instruction = (
+        b"\n\nWork only inside this isolated checkout. "
+        b"Do not access or modify any parent repository."
+    )
     if arm == "A":
-        return task
+        return task + instruction
     if pack_path is None:
         raise ValueError("Arm B requires a materialised pack")  # noqa: TRY003
+    relative_pack = pack_path.relative_to(checkout).as_posix()
     return (
-        task + b"\n\nThe generated context pack is available at: " + str(pack_path).encode() + b"\n"
+        task
+        + b"\n\nThe generated context pack is available at: "
+        + relative_pack.encode()
+        + instruction
+        + b"\n"
     )
 
 
 def _changed_files(before: dict[str, str], checkout: Path) -> list[str]:
-    after = file_hashes(checkout)
-    return sorted(
-        set(before) | set(after) - {path for path in before if before[path] == after.get(path)}
-    )
+    return _changed_paths(before, file_hashes(checkout))
 
 
 def _guardrail_results(
@@ -261,10 +316,14 @@ def execute_attempt(  # noqa: PLR0913
     timeout: int,
 ) -> ExecutionResult:
     before = file_hashes(checkout)
-    prompt = _prompt_for(arm, task, pack_path)
-    prompt_path = checkout.parent / "prompt.md"
+    parent_root = parent_repository_root()
+    parent_before = _parent_evidence(parent_root) if parent_root else {"accessible": False}
+    prompt = _prompt_for(arm, task, pack_path, checkout)
+    prompt_path = checkout / ".evaluation-prompt.md"
     prompt_path.write_bytes(prompt)
-    environment = _isolated_environment(checkout.parent)
+    environment = _isolated_environment(checkout)
+    environment["OPENCODE_PROJECT_DIR"] = str(checkout)
+    environment["FARNA_CONTEXT_EVALUATION_CHECKOUT"] = str(checkout)
     command = [*command]
     started = time.monotonic()
     output = b""
@@ -303,10 +362,22 @@ def execute_attempt(  # noqa: PLR0913
         provider_failure_class = type(exc).__name__
     elapsed = time.monotonic() - started
     changed, scope_ok, deletion_ok, secret_ok = _guardrail_results(before, checkout, output, error)
+    parent_after = _parent_evidence(parent_root) if parent_root else {"accessible": False}
+    contamination_ok = parent_before == parent_after
+    contamination_evidence = {
+        "parent_before": parent_before,
+        "parent_after": parent_after,
+        "checkout_before_tree_sha256": tree_hash(checkout),
+        "checkout_changed_files": changed,
+        "checkout_root": str(checkout),
+    }
+
     oracle_passed: bool | None = None
     oracle_summary = "not_run:provider_failure"
-    if provider_ok:
+    if provider_ok and contamination_ok:
         oracle_passed, oracle_summary = _run_oracle(checkout, environment)
+    elif provider_ok:
+        oracle_summary = "not_run:contamination_invalidity"
     return ExecutionResult(
         process_status=process_status,
         returncode=returncode,
@@ -321,6 +392,8 @@ def execute_attempt(  # noqa: PLR0913
         scope_ok=scope_ok,
         test_deletion_ok=deletion_ok,
         secret_output_ok=secret_ok,
+        contamination_ok=contamination_ok,
+        contamination_evidence=contamination_evidence,
         prompt_sha256=sha256_bytes(prompt),
     )
 
@@ -360,18 +433,21 @@ def build_record(  # noqa: PLR0913
             "changed_file_scope": execution.scope_ok,
             "test_deletion_or_disablement": execution.test_deletion_ok,
             "secret_output": execution.secret_output_ok,
+            "contamination": execution.contamination_ok,
         }
         guardrails_ok = all(checks.values())
         outcome = "success" if execution.oracle_passed and guardrails_ok else "failure"
         validity = classify_attempt(
             setup_ok=True,
             harness_ok=True,
-            contamination_ok=True,
+            contamination_ok=execution.contamination_ok,
             provider_ok=execution.provider_ok,
             outcome=outcome,
         )
         if not execution.provider_ok:
             outcome = "provider_failure"
+        elif not execution.contamination_ok:
+            outcome = "failure"
     return {
         "experiment_id": experiment_id,
         "protocol_version": protocol["protocol_version"],
@@ -448,11 +524,14 @@ def build_record(  # noqa: PLR0913
             "checks": checks,
         },
         "contamination_check": {
-            "status": "passed",
+            "status": "passed"
+            if dry_run
+            else ("passed" if execution and execution.contamination_ok else "failed"),
             "cross_arm_outputs": False,
             "fresh_checkout": True,
             "fresh_session": True,
             "fresh_cache": True,
+            "evidence": execution.contamination_evidence if execution else {},
         },
         "harness_load_status": "not_applicable" if arm == "A" else "observed",
         "model_use_status": "not_run"
@@ -488,7 +567,7 @@ def run_evaluation(  # noqa: PLR0913
             post_pack_hash: str | None = None
             pack_path: Path | None = None
             if arm == "B":
-                pack_path = temporary_path / "pack"
+                pack_path = checkout / ".evaluation-pack"
                 pack_hash, post_pack_hash = materialise_pack(checkout, pack_path)
             command = [executable, "run", "--auto", "--format", "json"]
             if model != "UNSPECIFIED":

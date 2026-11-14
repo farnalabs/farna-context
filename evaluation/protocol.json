@@ -55,7 +55,7 @@
     "cross_arm_outputs_allowed": false,
     "cross_arm_conversation_state_allowed": false,
     "parent_checkout_mutation_allowed": false,
-    "contamination_check": "Verify the parent checkout, checkout contents, pack destination, session state, and caches are isolated before and after every attempt.",
+    "contamination_check": "Verify the parent checkout, checkout contents, pack destination, session state, and caches are isolated before and after every attempt. Hash parent state before and after each subprocess; any parent change is contamination_invalidity, retain evidence, skip the oracle, and make the experiment inconclusive. The runner never deletes parent files.",
     "network_policy": "disabled by default; an explicitly enabled provider/network policy must be recorded",
     "permission_policy": "OpenCode runs with the caller-selected permissions; record the exact policy, never infer it"
   },
