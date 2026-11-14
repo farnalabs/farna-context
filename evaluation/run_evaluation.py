@@ -32,13 +32,42 @@ _OUTPUT_LIMIT = 8000
 _ALLOWED_CHANGED_FILES = {"src/slugify.py", "tests/test_slugify.py"}
 _IGNORED_TREE_PARTS = {
     ".git",
+    ".farna-context",
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
     "__pycache__",
     ".venv",
+    "venv",
+    "cache",
+    "node_modules",
+    ".tox",
+    ".nox",
+    ".coverage",
+    "htmlcov",
+    "dist",
+    "build",
 }
-_IGNORED_TREE_NAMES = {".evaluation-prompt.md", ".evaluation-pack", "context-pack.json"}
+_IGNORED_TREE_NAMES = {
+    ".evaluation-prompt.md",
+    ".evaluation-pack",
+    ".evaluation-output",
+    ".evaluation-runs",
+    "evaluation-pack",
+    "evaluation-output",
+    "evaluation-runs",
+    "runs",
+    "context-pack.json",
+}
+_MAX_SNAPSHOT_ERRORS = 20
+
+
+@dataclass(frozen=True)
+class TreeSnapshot:
+    hashes: dict[str, str]
+    errors: tuple[str, ...] = ()
+
+
 _SECRET_PATTERNS = {
     "github_token": re.compile(rb"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
     "private_key": re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
@@ -72,6 +101,9 @@ class ExecutionResult:
     contamination_ok: bool
     contamination_evidence: dict[str, Any]
     prompt_sha256: str
+    setup_ok: bool
+    harness_ok: bool
+    guard_error: str | None
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -82,38 +114,115 @@ def sha256_file(path: Path) -> str:
     return sha256_bytes(path.read_bytes())
 
 
+def _is_ignored_relative(relative: Path) -> bool:
+    return any(part in _IGNORED_TREE_PARTS for part in relative.parts) or any(
+        part in _IGNORED_TREE_NAMES for part in relative.parts
+    )
+
+
 def _tracked_tree_paths(root: Path) -> list[Path]:
-    return [
-        path
-        for path in root.rglob("*")
-        if path.is_file()
-        and not any(part in _IGNORED_TREE_PARTS for part in path.relative_to(root).parts)
-        and not any(part in _IGNORED_TREE_NAMES for part in path.relative_to(root).parts)
-    ]
+    paths: list[Path] = []
+    for directory, directory_names, file_names in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        relative_directory = directory_path.relative_to(root)
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if not _is_ignored_relative(relative_directory / name)
+            and not (directory_path / name).is_symlink()
+        ]
+        for name in file_names:
+            path = directory_path / name
+            relative = path.relative_to(root)
+            if not _is_ignored_relative(relative) and not path.is_symlink():
+                paths.append(path)
+    return paths
+
+
+def _snapshot_tree(root: Path) -> TreeSnapshot:
+    hashes: dict[str, str] = {}
+    errors: list[str] = []
+    for path in sorted(_tracked_tree_paths(root)):
+        relative_name = path.relative_to(root).as_posix()
+        try:
+            hashes[relative_name] = sha256_file(path)
+        except (OSError, ValueError) as exc:
+            if len(errors) < _MAX_SNAPSHOT_ERRORS:
+                errors.append(f"{relative_name}:{type(exc).__name__}")
+    return TreeSnapshot(hashes=hashes, errors=tuple(errors))
 
 
 def tree_hash(root: Path) -> str:
+    snapshot = _snapshot_tree(root)
+    if snapshot.errors:
+        raise OSError("unstable tree snapshot")  # noqa: TRY003
     digest = hashlib.sha256()
     for path in sorted(_tracked_tree_paths(root)):
         relative = path.relative_to(root).as_posix().encode()
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise OSError("unstable tree snapshot") from exc  # noqa: TRY003
         digest.update(relative)
         digest.update(b"\0")
-        digest.update(path.read_bytes())
+        digest.update(content)
         digest.update(b"\0")
     return digest.hexdigest()
 
 
 def file_hashes(root: Path) -> dict[str, str]:
-    return {
-        path.relative_to(root).as_posix(): sha256_file(path) for path in _tracked_tree_paths(root)
-    }
+    snapshot = _snapshot_tree(root)
+    if snapshot.errors:
+        raise OSError("unstable file snapshot")  # noqa: TRY003
+    return snapshot.hashes
+
+
+def _strict_snapshot(root: Path) -> TreeSnapshot:
+    hashes: dict[str, str] = {}
+    errors: list[str] = []
+    for directory, _, file_names in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        for name in file_names:
+            path = directory_path / name
+            relative_name = path.relative_to(root).as_posix()
+            try:
+                if path.is_symlink():
+                    hashes[relative_name] = sha256_bytes(path.readlink().as_posix().encode())
+                else:
+                    hashes[relative_name] = sha256_file(path)
+            except (OSError, ValueError) as exc:
+                if len(errors) < _MAX_SNAPSHOT_ERRORS:
+                    errors.append(f"{relative_name}:{type(exc).__name__}")
+        for path in directory_path.iterdir():
+            if path.is_symlink() and path.is_dir():
+                relative_name = path.relative_to(root).as_posix()
+                hashes[relative_name] = sha256_bytes(path.readlink().as_posix().encode())
+    return TreeSnapshot(hashes=hashes, errors=tuple(errors))
+
+
+def _snapshot_digest(snapshot: TreeSnapshot) -> str:
+    digest = hashlib.sha256()
+    for relative_name, file_hash in sorted(snapshot.hashes.items()):
+        digest.update(relative_name.encode())
+        digest.update(b"\0")
+        digest.update(file_hash.encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _parent_evidence(root: Path) -> dict[str, Any]:
-    try:
-        return {"path": str(root), "accessible": True, "tree_hash": tree_hash(root)}
-    except OSError as exc:
-        return {"path": str(root), "accessible": False, "error": type(exc).__name__}
+    snapshot = _strict_snapshot(root)
+    evidence: dict[str, Any] = {
+        "path": str(root),
+        "accessible": not snapshot.errors,
+        "tree_hash": None,
+    }
+    if snapshot.errors:
+        evidence["error"] = "unstable_snapshot"
+        evidence["unstable_paths"] = list(snapshot.errors)
+    else:
+        evidence["tree_hash"] = _snapshot_digest(snapshot)
+    return evidence
 
 
 def _changed_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
@@ -260,8 +369,11 @@ def _changed_files(before: dict[str, str], checkout: Path) -> list[str]:
 
 def _guardrail_results(
     before: dict[str, str], checkout: Path, output: bytes, error: bytes
-) -> tuple[list[str], bool, bool, bool]:
-    after = file_hashes(checkout)
+) -> tuple[list[str], bool, bool, bool, str | None]:
+    try:
+        after = file_hashes(checkout)
+    except OSError:
+        return [], False, False, False, "checkout_snapshot_unstable"
     changed = sorted(
         path for path in set(before) | set(after) if before.get(path) != after.get(path)
     )
@@ -285,7 +397,7 @@ def _guardrail_results(
             ):
                 secret_ok = False
                 break
-    return changed, scope_ok, deletion_ok, secret_ok
+    return changed, scope_ok, deletion_ok, secret_ok, None
 
 
 def _run_oracle(checkout: Path, environment: dict[str, str]) -> tuple[bool, str]:
@@ -306,7 +418,7 @@ def _run_oracle(checkout: Path, environment: dict[str, str]) -> tuple[bool, str]
     return completed.returncode == 0, summary
 
 
-def execute_attempt(  # noqa: PLR0913
+def execute_attempt(  # noqa: PLR0913, PLR0915
     *,
     arm: str,
     checkout: Path,
@@ -315,7 +427,30 @@ def execute_attempt(  # noqa: PLR0913
     command: list[str],
     timeout: int,
 ) -> ExecutionResult:
-    before = file_hashes(checkout)
+    try:
+        before = file_hashes(checkout)
+    except OSError:
+        return ExecutionResult(
+            process_status="setup_error",
+            returncode=None,
+            stdout_summary="",
+            stderr_summary="",
+            elapsed_seconds=0.0,
+            provider_ok=False,
+            provider_failure_class=None,
+            oracle_passed=None,
+            oracle_summary="not_run:setup_invalidity",
+            changed_files=[],
+            scope_ok=False,
+            test_deletion_ok=False,
+            secret_output_ok=True,
+            contamination_ok=True,
+            contamination_evidence={"error": "checkout_snapshot_unstable"},
+            prompt_sha256="",
+            setup_ok=False,
+            harness_ok=True,
+            guard_error="checkout_snapshot_unstable",
+        )
     parent_root = parent_repository_root()
     parent_before = _parent_evidence(parent_root) if parent_root else {"accessible": False}
     prompt = _prompt_for(arm, task, pack_path, checkout)
@@ -361,13 +496,24 @@ def execute_attempt(  # noqa: PLR0913
         process_status = "process_error"
         provider_failure_class = type(exc).__name__
     elapsed = time.monotonic() - started
-    changed, scope_ok, deletion_ok, secret_ok = _guardrail_results(before, checkout, output, error)
+    changed, scope_ok, deletion_ok, secret_ok, guard_error = _guardrail_results(
+        before, checkout, output, error
+    )
     parent_after = _parent_evidence(parent_root) if parent_root else {"accessible": False}
-    contamination_ok = parent_before == parent_after
+    contamination_ok = parent_before == parent_after and parent_after.get("accessible", False)
+    setup_ok = guard_error is None
+    harness_ok = True
+    try:
+        checkout_before_hash = tree_hash(checkout)
+    except OSError:
+        checkout_before_hash = None
+        guard_error = guard_error or "checkout_snapshot_unstable"
+        setup_ok = False
+        harness_ok = False
     contamination_evidence = {
         "parent_before": parent_before,
         "parent_after": parent_after,
-        "checkout_before_tree_sha256": tree_hash(checkout),
+        "checkout_before_tree_sha256": checkout_before_hash,
         "checkout_changed_files": changed,
         "checkout_root": str(checkout),
     }
@@ -395,6 +541,9 @@ def execute_attempt(  # noqa: PLR0913
         contamination_ok=contamination_ok,
         contamination_evidence=contamination_evidence,
         prompt_sha256=sha256_bytes(prompt),
+        setup_ok=setup_ok,
+        harness_ok=harness_ok,
+        guard_error=guard_error,
     )
 
 
@@ -438,8 +587,8 @@ def build_record(  # noqa: PLR0913
         guardrails_ok = all(checks.values())
         outcome = "success" if execution.oracle_passed and guardrails_ok else "failure"
         validity = classify_attempt(
-            setup_ok=True,
-            harness_ok=True,
+            setup_ok=execution.setup_ok,
+            harness_ok=execution.harness_ok,
             contamination_ok=execution.contamination_ok,
             provider_ok=execution.provider_ok,
             outcome=outcome,
@@ -497,6 +646,7 @@ def build_record(  # noqa: PLR0913
             "process_status": execution.process_status if execution else "not_run",
             "returncode": execution.returncode if execution else None,
             "provider_failure_class": execution.provider_failure_class if execution else None,
+            "guard_error": execution.guard_error if execution else None,
             "stdout_summary": execution.stdout_summary if execution else "",
             "stderr_summary": execution.stderr_summary if execution else "",
         },
