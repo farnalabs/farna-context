@@ -102,12 +102,12 @@ def _validate_output_parent(output_path: Path) -> None:
     parts = parent.parts[1:] if parent.anchor else parent.parts
     for component in parts:
         current /= component
-        if not current.exists():
+        try:
+            info = current.lstat()
+        except FileNotFoundError as exc:
+            raise ValueError("Unsafe output path") from exc  # noqa: TRY003
+        if _is_reparse_point(current) or not stat.S_ISDIR(info.st_mode):
             raise ValueError("Unsafe output path")  # noqa: TRY003
-        if _is_reparse_point(current):
-            raise ValueError("Unsafe output path")  # noqa: TRY003
-    if not parent.is_dir():
-        raise ValueError("Unsafe output path")  # noqa: TRY003
 
 
 def atomic_write_bytes(output_path: Path, data: bytes) -> None:
