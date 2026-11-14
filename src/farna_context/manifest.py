@@ -30,18 +30,17 @@ class Manifest:
     represented as records already observed by the audit.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         config: LocalConfig,
         audit: AuditResult,
         repo_root: Path,
         revision: str,
-        *,
         audit_hash: str | None = None,
         config_hash: str | None = None,
         task_brief_hash: str | None = None,
         audit_data: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> None:  # noqa: PLR0913, PLR0917
         self.config = config
         self.audit = audit
         self.repo_root = repo_root.resolve()
@@ -95,7 +94,7 @@ class Manifest:
 
     def to_yaml(self) -> str:
         """Convert manifest to YAML for the legacy context-pack format."""
-        return yaml.dump(self.to_dict(), sort_keys=False, default_flow_style=False)
+        return str(yaml.dump(self.to_dict(), sort_keys=False, default_flow_style=False))
 
     def save(self, output_path: Path) -> None:
         """Save the canonical JSON manifest."""
@@ -126,38 +125,41 @@ def _audit_to_dict(audit: AuditResult) -> dict[str, Any]:
 
 def _normalise_path(value: str | Path, repo_root: Path) -> str:
     path = Path(value)
-    try:
-        path = path.relative_to(repo_root)
-    except ValueError:
-        pass
+    if path.is_absolute():
+        try:
+            return path.relative_to(repo_root).as_posix()
+        except ValueError:
+            return path.as_posix()
     return path.as_posix()
 
 
 def _source_dicts(
     audit_data: dict[str, Any], audit: AuditResult, repo_root: Path
 ) -> list[dict[str, Any]]:
-    raw_sources = audit_data.get("sources")
-    if not isinstance(raw_sources, list):
-        raw_sources = []
-        for source in audit.sources:
-            raw_sources.append(
-                {
-                    "path": str(source.path),
-                    "source_class": source.source_class,
-                    "included": source.included,
-                    "configured": source.configured,
-                    "required": source.required,
-                    "readable": source.readable,
-                    "raw_hash": source.raw_hash,
-                    "exclusion_reason": source.exclusion_reason,
-                }
-            )
+    raw_sources: list[dict[str, Any]] = []
+    raw_value = audit_data.get("sources")
+    if isinstance(raw_value, list):
+        raw_sources = [item for item in raw_value if isinstance(item, dict)]
+    else:
+        raw_sources = [
+            {
+                "path": str(source.path),
+                "source_class": source.source_class,
+                "included": source.included,
+                "configured": source.configured,
+                "required": source.required,
+                "readable": source.readable,
+                "raw_hash": source.raw_hash,
+                "exclusion_reason": source.exclusion_reason,
+            }
+            for source in audit.sources
+        ]
 
     result: list[dict[str, Any]] = []
     for raw in raw_sources:
-        if not isinstance(raw, dict) or not isinstance(raw.get("path"), str):
-            raise ManifestError("invalid audit: every source must have a path")
-        source = dict(raw)
+        if not isinstance(raw.get("path"), str):
+            raise ManifestError
+        source: dict[str, Any] = dict(raw)
         source["path"] = _normalise_path(source["path"], repo_root)
         source.pop("absolute_path", None)
         result.append(source)
@@ -167,7 +169,7 @@ def _source_dicts(
 def _list_from_audit(audit_data: dict[str, Any], key: str) -> list[Any]:
     value = audit_data.get(key, [])
     if not isinstance(value, list):
-        raise ManifestError(f"invalid audit: {key} must be a list")
+        raise ManifestError
     return sorted(value, key=lambda item: json.dumps(item, sort_keys=True, default=str))
 
 
@@ -208,12 +210,12 @@ def load_audit(audit_path: Path) -> tuple[dict[str, Any], str]:
         raw = audit_path.read_bytes()
         data = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ManifestError(f"invalid audit: {exc}") from exc
+        raise ManifestError from exc
     if not isinstance(data, dict) or not isinstance(data.get("sources", []), list):
-        raise ManifestError("invalid audit: expected an object with a sources list")
+        raise ManifestError
     actual_hash = hashlib.sha256(raw).hexdigest()
     if not _audit_path_hash_matches(data, actual_hash):
-        raise InputChangedError("audit.json hash mismatch")
+        raise InputChangedError
     return data, actual_hash
 
 
@@ -222,17 +224,21 @@ def audit_result_from_dict(data: dict[str, Any]) -> AuditResult:
     result = AuditResult()
     for raw in data.get("sources", []):
         if not isinstance(raw, dict) or not isinstance(raw.get("path"), str):
-            raise ManifestError("invalid audit: malformed source record")
+            raise ManifestError
         source = SourceRecord(
             path=Path(raw["path"]),
-            source_class=raw.get("source_class", "instruction"),
+            source_class="instruction",
             required=bool(raw.get("required", False)),
-            configured=bool(raw.get("configured", True)),
-            readable=raw.get("readable"),
+            configured=True,
+            readable=bool(raw.get("readable", False)),
             read_error=raw.get("read_error"),
             raw_hash=raw.get("raw_hash"),
             included=bool(raw.get("included", False)),
             exclusion_reason=raw.get("exclusion_reason"),
+            path_scope=str(raw.get("path_scope", "/")),
+            precedence=int(raw.get("precedence", 100)),
+            is_conflict=bool(raw.get("is_conflict", False)),
+            conflict_detail=raw.get("conflict_detail"),
         )
         result.sources.append(source)
     return result
@@ -256,11 +262,11 @@ def run_manifest(audit_path: Path, out_path: Path) -> int:
             task_brief_hash=audit_data.get("task_brief_hash"),
             audit_data=audit_data,
         )
-        if audit_data.get("blocked_sources") or audit_data.get("errors"):
-            manifest.save(out_path)
-            return 10
         manifest.save(out_path)
-        return 0
+        if audit_data.get("blocked_sources") or audit_data.get("errors"):
+            return 10
+        else:  # noqa: RET505
+            return 0
     except InputChangedError:
         return 11
     except ManifestError:

@@ -5,14 +5,13 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
-from rich.table import Table
 
-from .audit import audit_sources
+from .audit import AuditContext, audit_sources, collect_audit_result, run_audit
 from .compile import compile_context_pack
 from .config import LocalConfig, load_config, save_config
 from .constants import CONFIG_FILE, ExitCode, OutcomeStatus, RequestedBy
 from .git import GitError, get_repo_root, get_revision
-from .manifest import generate_manifest
+from .manifest import generate_manifest, run_manifest
 from .materialise import materialise_files, materialise_to_stdout
 from .receipt import generate_receipt
 from .secrets import scan_sources
@@ -95,73 +94,71 @@ def audit(
     config_path: Annotated[
         Path | None, typer.Option("--config", "-c", help="Path to config file")
     ] = None,
+    out_path: Annotated[Path | None, typer.Option("--out", help="Path for audit.json")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Verbose output")] = False,
 ) -> None:
-    """Audit source files based on configuration."""
-    try:
-        config, repo_root = _get_config_and_repo(config_path)
-
-        console.print(f"[bold]Repository:[/bold] {repo_root}")
-        console.print(f"[bold]Config:[/bold] {config_path or 'default'}")
-
-        audit_result = audit_sources(config, repo_root)
-
-        # Summary table
-        table = Table(title="Audit Results")
-        table.add_column("Category", style="cyan")
-        table.add_column("Count", style="magenta")
-        table.add_row("Instruction files", str(len(audit_result.instruction_files)))
-        table.add_row("Explicit files", str(len(audit_result.explicit_files)))
-        table.add_row("Skills files", str(len(audit_result.skills_files)))
-        table.add_row("Scoped files", str(len(audit_result.scoped_files)))
-        table.add_row("Missing required", str(len(audit_result.missing_required)))
-        table.add_row("Errors", str(len(audit_result.errors)))
-        console.print(table)
-
-        if verbose:
-            if audit_result.instruction_files:
-                console.print("\n[bold]Instruction files:[/bold]")
-                for f in audit_result.instruction_files:
-                    console.print(f"  {f.relative_to(repo_root)}")
-
-            if audit_result.missing_required:
-                console.print("\n[bold red]Missing required:[/bold red]")
-                for m in audit_result.missing_required:
-                    console.print(f"  {m}")
-
-            if audit_result.errors:
-                console.print("\n[bold red]Errors:[/bold red]")
-                for e in audit_result.errors:
-                    console.print(f"  {e}")
-
-    except GitError as e:
-        _handle_git_error(e)
-    except Exception as e:
-        _handle_generic_error(e, ExitCode.CONFIG_ERROR)
+    """Audit source files and write audit.json."""
+    del verbose
+    resolved_config = config_path or (Path.cwd() / CONFIG_FILE)
+    resolved_out = out_path or (resolved_config.parent / "audit.json")
+    exit_code = run_audit(resolved_config, resolved_out)
+    console.print(f"Audit output: {resolved_out}")
+    if exit_code:
+        _exit_with_error(
+            ExitCode(exit_code) if exit_code in {0, 2, 10, 11} else ExitCode.CONFIG_ERROR
+        )
 
 
 @app.command()
 def manifest(
+    audit_path: Annotated[Path | None, typer.Option("--audit")] = None,
+    output: Annotated[
+        Path | None, typer.Option("--out", "--output", "-o", help="Output manifest path")
+    ] = None,
     config_path: Annotated[
         Path | None, typer.Option("--config", "-c", help="Path to config file")
     ] = None,
-    output: Annotated[Path | None, typer.Option("--output", "-o", help="Output file path")] = None,
 ) -> None:
-    """Generate manifest from audited sources."""
+    """Generate a canonical JSON manifest from an audit JSON file."""
     try:
+        if audit_path is not None:
+            output_path = output or Path(".farna-context/manifest.json")
+            exit_code = run_manifest(audit_path, output_path)
+            if exit_code == 0:
+                console.print(f"[green]Manifest written to {output_path}[/green]")
+            elif exit_code == int(ExitCode.REPO_NOT_FOUND):
+                console.print("[red]Manifest blocked by source issues in audit[/red]")
+            elif exit_code == int(ExitCode.DIRTY_TREE):
+                console.print("[red]Audit input changed since it was recorded[/red]")
+            else:
+                console.print("[red]Invalid audit[/red]")
+        if exit_code:
+            _exit_with_error(
+                ExitCode(exit_code) if exit_code in {0, 2, 10, 11} else ExitCode.MANIFEST_ERROR
+            )
+            return
+
         config, repo_root = _get_config_and_repo(config_path)
         revision = get_revision(repo_root)
-
-        audit_result = audit_sources(config, repo_root)
+        sources = audit_sources(config, repo_root)
+        audit_result = collect_audit_result(
+            AuditContext(
+                config=config,
+                repo_root=repo_root,
+                revision=revision,
+                sources=sources,
+                task_brief_hash="",
+                config_hash="",
+            )
+        )
         manifest_obj = generate_manifest(config, audit_result, repo_root, revision)
-
         output_path = output or Path(config.output_files.manifest)
         manifest_obj.save(output_path)
-
         console.print(f"[green]Manifest written to {output_path}[/green]")
-
     except GitError as e:
         _handle_git_error(e)
+    except typer.Exit:
+        raise
     except Exception as e:
         _handle_generic_error(e, ExitCode.MANIFEST_ERROR)
 
@@ -178,7 +175,16 @@ def compile(
         config, repo_root = _get_config_and_repo(config_path)
         revision = get_revision(repo_root)
 
-        audit_result = audit_sources(config, repo_root)
+        sources = audit_sources(config, repo_root)
+        audit_context = AuditContext(
+            config=config,
+            repo_root=repo_root,
+            revision=revision,
+            sources=sources,
+            task_brief_hash="",
+            config_hash="",
+        )
+        audit_result = collect_audit_result(audit_context)
         context_pack = compile_context_pack(config, audit_result, repo_root, revision)
 
         output_path = output or Path(config.output_files.context_pack)
@@ -206,8 +212,18 @@ def materialise(
     """Materialise source files to output directory or stdout."""
     try:
         config, repo_root = _get_config_and_repo(config_path)
+        revision = get_revision(repo_root)
 
-        audit_result = audit_sources(config, repo_root)
+        sources = audit_sources(config, repo_root)
+        audit_context = AuditContext(
+            config=config,
+            repo_root=repo_root,
+            revision=revision,
+            sources=sources,
+            task_brief_hash="",
+            config_hash="",
+        )
+        audit_result = collect_audit_result(audit_context)
 
         if mode == "stdout":
             output = materialise_to_stdout(config, audit_result, repo_root)
@@ -240,7 +256,16 @@ def verify(
         config, repo_root = _get_config_and_repo(config_path)
         revision = get_revision(repo_root)
 
-        audit_result = audit_sources(config, repo_root)
+        sources = audit_sources(config, repo_root)
+        audit_context = AuditContext(
+            config=config,
+            repo_root=repo_root,
+            revision=revision,
+            sources=sources,
+            task_brief_hash="",
+            config_hash="",
+        )
+        audit_result = collect_audit_result(audit_context)
         result = verify_all(config, audit_result, repo_root, revision)
 
         if result.verified:
@@ -280,7 +305,16 @@ def receipt(
         config, repo_root = _get_config_and_repo(config_path)
         revision = get_revision(repo_root)
 
-        audit_result = audit_sources(config, repo_root)
+        sources = audit_sources(config, repo_root)
+        audit_context = AuditContext(
+            config=config,
+            repo_root=repo_root,
+            revision=revision,
+            sources=sources,
+            task_brief_hash="",
+            config_hash="",
+        )
+        audit_result = collect_audit_result(audit_context)
         manifest_obj = generate_manifest(config, audit_result, repo_root, revision)
 
         receipt_obj = generate_receipt(
@@ -312,8 +346,18 @@ def secrets(
     """Scan source files for secrets."""
     try:
         config, repo_root = _get_config_and_repo(config_path)
+        revision = get_revision(repo_root)
 
-        audit_result = audit_sources(config, repo_root)
+        sources = audit_sources(config, repo_root)
+        audit_context = AuditContext(
+            config=config,
+            repo_root=repo_root,
+            revision=revision,
+            sources=sources,
+            task_brief_hash="",
+            config_hash="",
+        )
+        audit_result = collect_audit_result(audit_context)
         result = scan_sources(audit_result, config.secret_patterns, repo_root)
 
         if result.has_secrets():
