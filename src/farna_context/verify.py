@@ -32,15 +32,24 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _expected_sources(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    value = plan.get("outputs")
+    if isinstance(value, list):
+        sources = []
+        for item in value:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                raise InvalidManifestError("Verification plan contains an invalid output")  # noqa: TRY003
+            expected_hash = item.get("sha256")
+            if not isinstance(expected_hash, str):
+                raise InvalidManifestError("Verification plan output has no hash")  # noqa: TRY003
+            sources.append({"path": item["path"], "hash": expected_hash})
+        return sources
     value = plan.get("included_sources")
     if not isinstance(value, list):
         considered = plan.get("considered_sources", plan.get("sources", []))
-        if not isinstance(considered, list):
-            considered = []
         value = [item for item in considered if isinstance(item, dict) and item.get("included")]
     if not isinstance(value, list):
         raise InvalidManifestError("Verification plan has no included_sources")  # noqa: TRY003
-    sources: list[dict[str, Any]] = []
+    sources = []
     for item in value:
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
             raise InvalidManifestError("Verification plan contains an invalid source")  # noqa: TRY003
@@ -56,7 +65,7 @@ def _record_mismatch(result: VerificationResult, file: str, expected: str, actua
 
 
 def _contained_output_path(output_path: Path, relative_path: str) -> Path:
-    """Return an output path only when it stays inside a fresh, regular directory."""
+    """Return an output path only when it stays inside a regular directory."""
     root = output_path.resolve(strict=True)
     if not root.is_dir() or output_path.is_symlink():
         raise ValueError("Unsafe materialisation output")  # noqa: TRY003
@@ -90,8 +99,8 @@ def _verify_materialised_directory(
         result.errors.append(str(exc))
 
 
-def _verify_pack(plan: dict[str, Any], output_path: Path, result: VerificationResult) -> None:
-    pack = _load_json(output_path)
+def _verify_pack(plan: dict[str, Any], pack_path: Path, result: VerificationResult) -> None:
+    pack = _load_json(pack_path)
     pack_hash = pack.get("pack_hash")
     if not isinstance(pack_hash, str):
         result.errors.append("Pack has no pack_hash")
@@ -142,6 +151,10 @@ def verify_all(plan_path: Path, output_path: Path) -> VerificationResult:
     result = VerificationResult()
     try:
         plan = _load_json(plan_path)
+        if "output_dir" in plan:
+            planned_output = Path(str(plan["output_dir"]))
+            if output_path != planned_output:
+                output_path = planned_output
         if output_path.is_dir():
             _verify_materialised_directory(plan, output_path, result)
         elif output_path.is_file():

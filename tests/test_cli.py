@@ -258,12 +258,28 @@ def test_clean_fixture_full_sequence_reaches_receipt(
         ).exit_code
         == 0
     )
-    assert (
-        runner.invoke(
-            app, ["verify", "--plan", str(manifest_path), "--out", str(pack_path)]
-        ).exit_code
-        == 0
+    materialisation_path = tmp_path / "materialisation.json"
+    staging_parent = tmp_path / "staging"
+    materialise_result = runner.invoke(
+        app,
+        [
+            "materialise",
+            "--pack",
+            str(pack_path),
+            "--parent",
+            str(staging_parent),
+            "--out",
+            str(materialisation_path),
+        ],
     )
+    assert materialise_result.exit_code == 0
+    verification_path = tmp_path / "verification.json"
+    verify_result = runner.invoke(
+        app,
+        ["verify", "--plan", str(materialisation_path), "--out", str(verification_path)],
+    )
+    assert verify_result.exit_code == 0
+    assert verification_path.is_file()
     receipt_result = runner.invoke(app, ["receipt", "--output", str(receipt_path)])
 
     assert receipt_result.exit_code == 0
