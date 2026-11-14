@@ -207,10 +207,16 @@ def test_unexpected_file_scope_fails_even_with_passing_oracle(tmp_path: Path) ->
         """
 from pathlib import Path
 Path('src/slugify.py').write_text(
-    'def slugify(value: str) -> str:\\n    return value\\n', encoding='utf-8'
+    'import re\\n\\n\\ndef slugify(value: str) -> str:\\n'
+    '    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")\\n',
+    encoding='utf-8',
 )
 Path('tests/test_slugify.py').write_text(
-    'def test_slugify() -> None:\\n    assert True\\n', encoding='utf-8'
+    'from src.slugify import slugify\\n\\n\\n'
+    'def test_slugify() -> None:\\n'
+    '    assert slugify("Hello, world!") == "hello-world"\\n'
+    '    assert slugify("---") == ""\\n',
+    encoding='utf-8',
 )
 Path('unexpected.py').write_text('unexpected', encoding='utf-8')
 """,
