@@ -34,23 +34,31 @@ app = typer.Typer(
 console = Console()
 
 
-def _get_config_and_repo(config_path: Path | None = None) -> tuple[LocalConfig, Path]:
-    """Load config and determine repo root."""
-    if config_path is None:
-        cwd = Path.cwd()
-        for parent in [cwd] + list(cwd.parents):
-            candidate = parent / CONFIG_FILE
-            if candidate.exists():
-                config_path = candidate
-                break
+def _find_config_path() -> Path | None:
+    """Find the nearest project configuration from the current directory."""
+    cwd = Path.cwd()
+    for parent in [cwd] + list(cwd.parents):
+        candidate = parent / CONFIG_FILE
+        if candidate.exists():
+            return candidate
+    return None
 
-    if config_path is None:
+
+def _config_repo_base(config_path: Path) -> Path:
+    """Return the repository base used by config paths in every command."""
+    config_dir = config_path.parent
+    return config_dir.parent if config_dir.name == ".farna-context" else config_dir
+
+
+def _get_config_and_repo(config_path: Path | None = None) -> tuple[LocalConfig, Path]:
+    """Load config and determine repo root consistently for every command."""
+    resolved_config = config_path or _find_config_path()
+    if resolved_config is None:
         config = LocalConfig()
         repo_root = get_repo_root(Path.cwd())
     else:
-        config = load_config(config_path)
-        repo_root = config.get_repo_root_path(config_path.parent)
-
+        config = load_config(resolved_config)
+        repo_root = config.get_repo_root_path(_config_repo_base(resolved_config))
     return config, repo_root
 
 

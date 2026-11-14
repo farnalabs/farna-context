@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 from pathlib import Path
 from typing import Any
 
 from .exceptions import InvalidManifestError
-from .utils import canonical_json_bytes, sha256_bytes, sha256_file
+from .utils import canonical_json_bytes, reject_reparse_components, sha256_bytes, sha256_file
 
 
 class VerificationResult:
@@ -53,17 +55,39 @@ def _record_mismatch(result: VerificationResult, file: str, expected: str, actua
     result.mismatches.append({"file": file, "expected_hash": expected, "actual_hash": actual})
 
 
+def _contained_output_path(output_path: Path, relative_path: str) -> Path:
+    """Return an output path only when it stays inside a fresh, regular directory."""
+    root = output_path.resolve(strict=True)
+    if not root.is_dir() or output_path.is_symlink():
+        raise ValueError("Unsafe materialisation output")  # noqa: TRY003
+    reject_reparse_components(output_path)
+    relative = Path(relative_path)
+    candidate = output_path / relative
+    reject_reparse_components(candidate.parent)
+    try:
+        candidate.parent.resolve(strict=True).relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise ValueError("Unsafe materialisation output") from exc  # noqa: TRY003
+    if candidate.exists() and candidate.is_symlink():
+        raise ValueError("Unsafe materialisation output")  # noqa: TRY003
+    return candidate
+
+
 def _verify_materialised_directory(
     plan: dict[str, Any], output_path: Path, result: VerificationResult
 ) -> None:
-    for source in _expected_sources(plan):
-        path = output_path / source["path"]
-        if not path.is_file():
-            result.errors.append(f"Expected output not found: {source['path']}")
-            continue
-        actual_hash = sha256_file(path)
-        if actual_hash != source["hash"]:
-            _record_mismatch(result, source["path"], source["hash"], actual_hash)
+    try:
+        reject_reparse_components(output_path)
+        for source in _expected_sources(plan):
+            path = _contained_output_path(output_path, source["path"])
+            if not path.is_file():
+                result.errors.append(f"Expected output not found: {source['path']}")
+                continue
+            actual_hash = sha256_file(path)
+            if actual_hash != source["hash"]:
+                _record_mismatch(result, source["path"], source["hash"], actual_hash)
+    except (OSError, ValueError) as exc:
+        result.errors.append(str(exc))
 
 
 def _verify_pack(plan: dict[str, Any], output_path: Path, result: VerificationResult) -> None:
@@ -90,12 +114,25 @@ def _verify_pack(plan: dict[str, Any], output_path: Path, result: VerificationRe
             continue
         path = item["path"]
         actual_paths.add(path)
-        actual_hash = item.get("emitted_sha256")
+        declared_hash = item.get("emitted_sha256")
         expected_hash = expected.get(path)
-        if not isinstance(actual_hash, str) or expected_hash is None:
+        content = item.get("content_base64")
+        if not isinstance(declared_hash, str) or expected_hash is None:
             result.errors.append(f"Unexpected output source: {path}")
-        elif actual_hash != expected_hash:
-            _record_mismatch(result, path, expected_hash, actual_hash)
+            continue
+        if not isinstance(content, str):
+            result.errors.append(f"Pack source has no embedded content: {path}")
+            continue
+        try:
+            embedded_bytes = base64.b64decode(content, validate=True)
+        except (binascii.Error, ValueError):
+            result.errors.append(f"Pack source has invalid embedded content: {path}")
+            continue
+        actual_hash = sha256_bytes(embedded_bytes)
+        if actual_hash != declared_hash:
+            _record_mismatch(result, path, declared_hash, actual_hash)
+        if declared_hash != expected_hash:
+            _record_mismatch(result, path, expected_hash, declared_hash)
     for path in sorted(set(expected) - actual_paths):
         result.errors.append(f"Expected output source not found in pack: {path}")
 

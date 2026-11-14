@@ -176,6 +176,59 @@ def test_secrets_database_url_fixture_is_expected_finding(tmp_path: Path) -> Non
     assert "No secrets found" not in result.stdout
 
 
+def test_clean_fixture_full_sequence_reaches_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "AGENTS.md").write_text("instructions\n", encoding="utf-8")
+    git_repo = Repo.init(repo)
+    git_repo.index.add(["AGENTS.md"])
+    git_repo.index.commit("fixture")
+    monkeypatch.chdir(repo)
+    runner = CliRunner()
+
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    git_repo.index.add([".farna-context/config.json"])
+    git_repo.index.commit("add context config")
+    audit_path = repo / ".farna-context" / "audit.json"
+    manifest_path = repo / ".farna-context" / "manifest.json"
+    pack_path = repo / ".farna-context" / "pack.json"
+    receipt_path = repo / ".farna-context" / "receipt.json"
+    assert runner.invoke(app, ["audit", "--out", str(audit_path)]).exit_code == 0
+    assert (
+        runner.invoke(
+            app, ["manifest", "--audit", str(audit_path), "--out", str(manifest_path)]
+        ).exit_code
+        == 0
+    )
+    assert (
+        runner.invoke(
+            app,
+            [
+                "compile",
+                "--manifest",
+                str(manifest_path),
+                "--config",
+                str(repo / ".farna-context" / "config.json"),
+                "--out",
+                str(pack_path),
+            ],
+        ).exit_code
+        == 0
+    )
+    assert (
+        runner.invoke(
+            app, ["verify", "--plan", str(manifest_path), "--out", str(pack_path)]
+        ).exit_code
+        == 0
+    )
+    receipt_result = runner.invoke(app, ["receipt", "--output", str(receipt_path)])
+
+    assert receipt_result.exit_code == 0
+    assert receipt_path.is_file()
+
+
 def test_verify_command_checks_existing_pack_without_recompiling(tmp_path: Path) -> None:
     manifest, config, output = _inputs(tmp_path)
     compiled = CliRunner().invoke(
