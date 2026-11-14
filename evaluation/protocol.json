@@ -6,10 +6,10 @@
   "frozen_inputs": {
     "fixture": "synthetic",
     "fixture_revision": "PENDING_COMMIT",
-    "fixture_tree_sha256": "COMPUTED_AT_RUN",
+    "fixture_tree_sha256": "4c255689a70764e535ab112a1084eec2372a6c183bfe0b7be2108342c913dc05",
     "task_id": "synthetic:slugify-unicode",
     "task_path": "TASK.md",
-    "task_input_sha256": "COMPUTED_AT_RUN",
+    "task_input_sha256": "997b0263a940fc375df16600b8547114ac650d12e4c59b729860b32a1cf0452a",
     "task_bytes": "Implement `slugify(value: str) -> str` in `src/slugify.py`.\n\nRequirements:\n- lowercase the input;\n- replace every run of non-alphanumeric characters with one hyphen;\n- remove leading and trailing hyphens;\n- return an empty string for an input with no alphanumeric characters;\n- preserve Unicode letters when deciding which characters are alphanumeric (for example, `café déjà vu` becomes `café-déjà-vu`);\n- add or update tests in `tests/test_slugify.py`.\n\nDo not modify files outside `src/slugify.py` and `tests/test_slugify.py`.\n",
     "private_constraint_fixture": "evaluation/fixtures/private-constraint.json",
     "protocol_sha256": "COMPUTED_AT_RUN"

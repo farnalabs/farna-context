@@ -12,8 +12,8 @@ from evaluation.run_evaluation import load_protocol, run_evaluation, synthetic_f
 from evaluation.scoring import DECISION_THRESHOLDS, classify_attempt, score_task
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_TASK_HASH = "bb6900332ee84e9330e5f2c91658b40cce35710b37dc1295768bf94934387c26"
-EXPECTED_FIXTURE_TREE_HASH = "1b5c29a6c8be7e41a724b657c2944d58a356dae6dd5b5b0fbb3740cc3ac9fcb7"
+EXPECTED_TASK_HASH = "997b0263a940fc375df16600b8547114ac650d12e4c59b729860b32a1cf0452a"
+EXPECTED_FIXTURE_TREE_HASH = "4c255689a70764e535ab112a1084eec2372a6c183bfe0b7be2108342c913dc05"
 EXPECTED_REPETITIONS = 5
 EXPECTED_ASSIGNMENT_SEED = 20261114
 EXPECTED_INVALIDITY_ASYMMETRY = 0.10
@@ -27,8 +27,8 @@ def test_protocol_has_required_boundaries_and_thresholds() -> None:
     protocol = load_protocol()
     assert protocol["protocol_version"] == "0.3.0"
     assert protocol["frozen_inputs"]["fixture"] == "synthetic"
-    assert protocol["frozen_inputs"]["fixture_tree_sha256"] == "COMPUTED_AT_RUN"
-    assert protocol["frozen_inputs"]["task_input_sha256"] == "COMPUTED_AT_RUN"
+    assert protocol["frozen_inputs"]["fixture_tree_sha256"] == EXPECTED_FIXTURE_TREE_HASH
+    assert protocol["frozen_inputs"]["task_input_sha256"] == EXPECTED_TASK_HASH
     assert protocol["frozen_inputs"]["task_bytes"]
     assert protocol["arms"]["A"]["context_type"] == "general"
     assert protocol["arms"]["B"]["context_type"] == "shadow_file"
