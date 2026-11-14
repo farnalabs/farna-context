@@ -5,7 +5,7 @@
   "generality": "low-generality exploratory evaluation; one synthetic fixture and one bounded task do not support product-wide claims",
   "frozen_inputs": {
     "fixture": "synthetic",
-    "fixture_revision": "PENDING_COMMIT",
+    "fixture_revision": "5743978ff88fe1a140316fb5ba379964971f3173",
     "fixture_tree_sha256": "4c255689a70764e535ab112a1084eec2372a6c183bfe0b7be2108342c913dc05",
     "task_id": "synthetic:slugify-unicode",
     "task_path": "TASK.md",
