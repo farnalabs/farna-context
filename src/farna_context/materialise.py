@@ -5,13 +5,16 @@ from __future__ import annotations
 import base64
 import shutil
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from .audit import AuditResult
 from .compile import _load_json as load_pack_json
 from .config import LocalConfig
+from .context_types import ResolvedDelivery, decide_shadow_file_cleanup, shadow_file_preflight
 from .manifest import generate_manifest
+from .typed_context import DeliveryMode
 from .utils import (
     atomic_write_bytes,
     canonical_json_bytes,
@@ -139,6 +142,98 @@ def materialise_pack(pack_path: Path, parent: Path, plan_path: Path) -> dict[str
         shutil.rmtree(operation_dir, ignore_errors=True)
         raise
     return plan
+
+
+def materialise_typed_context(  # noqa: PLR0912
+    pack: dict[str, Any],
+    *,
+    repo_root: Path,
+    staging_parent: Path,
+    harness: str = "opencode",
+    ignore_checker: Callable[[Path, str], bool] | None = None,
+) -> dict[str, Any]:
+    """Materialise typed items and record a decision for every item."""
+    pack_hash = pack.get("pack_hash")
+    if not isinstance(pack_hash, str):
+        raise TypeError("Invalid typed context pack")  # noqa: TRY003, TRY004
+    prepare_output_directory(staging_parent)
+    operation_dir = Path(tempfile.mkdtemp(prefix="typed-context-", dir=staging_parent))
+    outcomes: list[dict[str, Any]] = []
+    general: list[str] = []
+    try:
+        for item in pack.get("items", []):
+            if not isinstance(item, dict):
+                raise TypeError("Invalid typed context item")  # noqa: TRY003, TRY004, TRY301
+            item_id = str(item["item_id"])
+            item_type = str(item["context_type"])
+            source = str(item["source_path"])
+            mode = item.get("delivery_mode")
+            status = "materialised"
+            reason: str | None = None
+            if item_type == "rule":
+                status = "adapter_required" if harness == "opencode" else "materialised"
+                reason = (
+                    "harness lacks native scoped-rule capability"
+                    if status == "adapter_required"
+                    else "scoped rule retained"
+                )
+            elif item_type == "general":
+                content = base64.b64decode(str(item["content_base64"]), validate=True).decode(
+                    "utf-8"
+                )
+                general.append(content)
+            elif item_type == "artefact":
+                if mode == DeliveryMode.REFERENCE_ONLY.value:
+                    reason = "reference recorded; content not copied"
+                elif mode == DeliveryMode.COPY_TO_STAGING.value:
+                    destination = operation_dir / Path(source).name
+                    atomic_write_bytes(
+                        destination, base64.b64decode(str(item["content_base64"]), validate=True)
+                    )
+                else:
+                    status, reason = (
+                        "adapter_required",
+                        "requested artefact delivery is unsupported",
+                    )
+            elif item_type == "shadow_file":
+                shadow_destination = str(item.get("shadow_destination", source))
+                decision = shadow_file_preflight(
+                    repo_root, shadow_destination, ignore_checker=ignore_checker
+                )
+                if not decision.safe:
+                    status, reason = "blocked", decision.reason
+                else:
+                    destination_path = repo_root / shadow_destination
+                    prepare_output_directory(destination_path.parent)
+                    atomic_write_bytes(
+                        destination_path,
+                        base64.b64decode(str(item["content_base64"]), validate=True),
+                    )
+                    outcomes.append(
+                        {"item_id": item_id, "status": status, "destination": shadow_destination}
+                    )
+                    continue
+            outcomes.append(
+                {"item_id": item_id, "status": status, "reason": reason, "source_path": source}
+            )
+        return {
+            "schema_version": "typed-materialisation-alpha-1",
+            "pack_hash": pack_hash,
+            "output_dir": str(operation_dir),
+            "general_context": "\n\n".join(general),
+            "outcomes": outcomes,
+        }
+    except Exception:
+        shutil.rmtree(operation_dir, ignore_errors=True)
+        raise
+
+
+def cleanup_typed_shadow(repo_root: Path, delivery: ResolvedDelivery) -> dict[str, Any]:
+    """Apply hash-aware cleanup only when the generated file is unchanged."""
+    decision = decide_shadow_file_cleanup(repo_root, delivery)
+    if decision.should_delete:
+        (repo_root / delivery.destination).unlink()
+    return decision.model_dump(mode="json")
 
 
 def materialise_to_stdout(config: LocalConfig, audit: AuditResult, repo_root: Path) -> str:
