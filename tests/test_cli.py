@@ -166,6 +166,114 @@ def test_compile_command_writes_pack(tmp_path: Path) -> None:
     assert "Pack hash:" in result.stdout
 
 
+def test_typed_context_cli_mixed_preview_compile_and_materialise(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".gitignore").write_text("generated/\n", encoding="utf-8")
+    (repo / "rule.md").write_text("scoped rule", encoding="utf-8")
+    (repo / "general.md").write_text("general context", encoding="utf-8")
+    (repo / "asset.bin").write_bytes(b"opaque")
+    (repo / "shadow.md").write_text("generated instructions", encoding="utf-8")
+    Repo.init(repo)
+    manifest = tmp_path / "typed.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "repo_root": str(repo),
+                "items": [
+                    {
+                        "item_id": "rule",
+                        "context_type": "rule",
+                        "source_path": "rule.md",
+                        "scope": {"path_glob": "src/**/*.py"},
+                    },
+                    {"item_id": "general", "context_type": "general", "source_path": "general.md"},
+                    {
+                        "item_id": "asset",
+                        "context_type": "artefact",
+                        "source_path": "asset.bin",
+                        "delivery_mode": "reference_only",
+                    },
+                    {
+                        "item_id": "shadow",
+                        "context_type": "shadow_file",
+                        "source_path": "shadow.md",
+                        "shadow_file_policy": {"destination": "generated/AGENTS.md"},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"secret_patterns": {}}), encoding="utf-8")
+    runner = CliRunner()
+
+    preview = runner.invoke(
+        app,
+        [
+            "context-preview",
+            "--input",
+            str(manifest),
+            "--repo-root",
+            str(repo),
+            "--policy",
+            str(policy),
+            "--json",
+        ],
+    )
+    assert preview.exit_code == 0
+    assert '"decision": "adapter_required"' in preview.stdout
+    assert "scoped rule" in preview.stdout
+    assert "scoped rule" not in preview.stdout.replace(
+        "scoped rule requires adapter at materialisation", ""
+    )
+
+    pack_path = tmp_path / "typed-pack.json"
+    compiled = runner.invoke(
+        app,
+        [
+            "context-compile",
+            "--input",
+            str(manifest),
+            "--config",
+            str(policy),
+            "--out",
+            str(pack_path),
+            "--json",
+        ],
+    )
+    assert compiled.exit_code == 0
+    assert pack_path.is_file()
+
+    result_path = tmp_path / "materialisation.json"
+    materialised = runner.invoke(
+        app,
+        [
+            "context-materialise",
+            "--pack",
+            str(pack_path),
+            "--policy",
+            str(policy),
+            "--repo-root",
+            str(repo),
+            "--staging-parent",
+            str(tmp_path / "staging"),
+            "--out",
+            str(result_path),
+            "--json",
+        ],
+    )
+    assert materialised.exit_code == 0
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    outcomes = {item["item_id"]: item for item in result["outcomes"]}
+    assert outcomes["rule"]["status"] == "materialised"
+    assert outcomes["opencode-rules-adapter"]["status"] == "materialised"
+    assert outcomes["asset"]["status"] == "materialised"
+    assert outcomes["shadow"]["status"] == "materialised"
+    assert "scoped rule" not in result_path.read_text(encoding="utf-8")
+
+
 def test_compile_requires_manifest_out_and_config(tmp_path: Path) -> None:
     manifest, config, output = _inputs(tmp_path)
     runner = CliRunner()

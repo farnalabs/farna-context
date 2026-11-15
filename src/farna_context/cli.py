@@ -10,8 +10,8 @@ import typer
 from rich.console import Console
 
 from .audit import AuditContext, AuditResult, audit_sources, collect_audit_result, run_audit
-from .compile import compile_manifest
-from .config import LocalConfig, load_config, save_config
+from .compile import _load_json, compile_manifest
+from .config import LocalConfig, SecretPatterns, load_config, save_config
 from .constants import CONFIG_FILE, ExitCode, OutcomeStatus, RequestedBy
 from .exceptions import (
     CompilationError,
@@ -22,9 +22,19 @@ from .exceptions import (
 )
 from .git import GitError, check_dirty_tree, get_repo_root, get_revision
 from .manifest import generate_manifest, run_manifest
-from .materialise import materialise_files, materialise_pack, materialise_to_stdout
+from .materialise import (
+    materialise_files,
+    materialise_pack,
+    materialise_to_stdout,
+    materialise_typed_context,
+)
 from .receipt import generate_receipt, load_receipt_artefact
 from .secrets import scan_sources
+from .typed_context import (
+    compile_typed_context,
+    load_typed_context_manifest,
+    preview_typed_context_data,
+)
 from .utils import atomic_write_bytes, canonical_json_bytes
 from .verify import verify_all
 
@@ -281,6 +291,127 @@ def compile(
     except Exception:
         console.print("Error: compilation failed")
         _exit_with_error(ExitCode.COMPILATION_ERROR)
+
+
+@app.command("context-preview")
+def context_preview(  # noqa: PLR0913, PLR0917
+    input_path: Annotated[Path, typer.Option("--input", "-i", exists=True, readable=True)],
+    repo_root: Annotated[
+        Path | None, typer.Option("--repo-root", help="Trusted repository root")
+    ] = None,
+    policy_path: Annotated[
+        Path | None, typer.Option("--policy", help="Secret policy/config JSON")
+    ] = None,
+    out: Annotated[Path | None, typer.Option("--out", help="Optional preview JSON path")] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON output")] = False,
+) -> None:
+    """Preview typed context selection without writing source content."""
+    try:
+        manifest = load_typed_context_manifest(input_path)
+        root = repo_root.resolve() if repo_root is not None else None
+        patterns = _load_secret_patterns(policy_path)
+        preview = preview_typed_context_data(manifest, repo_root=root, secret_patterns=patterns)
+        if out is not None:
+            atomic_write_bytes(out, canonical_json_bytes(preview))
+        if as_json:
+            console.print_json(json.dumps(preview))
+        else:
+            for decision in preview["decisions"]:
+                console.print(
+                    f"{decision['item_id']}: {decision['decision']} ({decision['reason']})"
+                )
+            if out is not None:
+                console.print(f"Preview written to {out}")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        console.print(f"Error: {exc}")
+        _exit_with_error(ExitCode.INVALID_ARGS)
+
+
+@app.command("context-compile")
+def context_compile(  # noqa: PLR0913, PLR0917
+    input_path: Annotated[Path, typer.Option("--input", "-i", exists=True, readable=True)],
+    output: Annotated[Path, typer.Option("--out", "-o", help="Canonical typed pack JSON path")],
+    config_path: Annotated[
+        Path | None, typer.Option("--config", "--policy", exists=True, readable=True)
+    ] = None,
+    repo_root: Annotated[
+        Path | None, typer.Option("--repo-root", help="Trusted repository root")
+    ] = None,
+    task: Annotated[Path | None, typer.Option("--task", exists=True, readable=True)] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON summary")] = False,
+) -> None:
+    """Compile typed context into an atomic canonical pack."""
+    del repo_root, task
+    try:
+        pack = compile_typed_context(input_path, output, config_path=config_path)
+        summary = {
+            "pack_hash": pack.pack_hash,
+            "out": str(output),
+            "selected": len(pack.payload.get("items", [])),
+            "omitted": len(pack.payload.get("omitted", [])),
+            "secret_literal_detector_count": pack.payload.get("secret_literal_detector_count", 0),
+        }
+        if as_json:
+            console.print_json(json.dumps(summary))
+        else:
+            console.print(f"Typed context pack written to {output}")
+            console.print(f"Pack hash: {pack.pack_hash}")
+    except ValueError as exc:
+        message = str(exc)
+        code = ExitCode.SECRET_DETECTED if "secret" in message.lower() else ExitCode.INVALID_ARGS
+        console.print(f"Error: {message}")
+        _exit_with_error(code)
+    except OSError as exc:
+        console.print(f"Error: {exc}")
+        _exit_with_error(ExitCode.WRITE_ERROR)
+
+
+def _load_secret_patterns(policy_path: Path | None) -> SecretPatterns:
+    """Load trusted secret policy metadata for typed materialisation."""
+    if policy_path is None:
+        raise ValueError("Trusted secret policy is required")  # noqa: TRY003
+    data, _ = _load_json(policy_path)
+    raw = data.get("secret_patterns")
+    if not isinstance(raw, dict):
+        raise TypeError("Trusted secret policy must contain secret_patterns")  # noqa: TRY003
+    return SecretPatterns.model_validate(raw)
+
+
+@app.command("context-materialise")
+def context_materialise(  # noqa: PLR0913, PLR0917
+    pack_path: Annotated[Path, typer.Option("--pack", exists=True, readable=True)],
+    policy_path: Annotated[Path, typer.Option("--policy", exists=True, readable=True)],
+    repo_root: Annotated[Path, typer.Option("--repo-root", exists=True, file_okay=False)],
+    staging_parent: Annotated[Path, typer.Option("--staging-parent")],
+    out: Annotated[Path, typer.Option("--out", help="Receipt/result JSON path")],
+    harness: Annotated[str, typer.Option("--harness")] = "opencode",
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON result")] = False,
+) -> None:
+    """Materialise a typed pack using an explicit trusted secret policy."""
+    try:
+        pack_data, _ = _load_json(pack_path)
+        patterns = _load_secret_patterns(policy_path)
+        result = materialise_typed_context(
+            pack_data,
+            repo_root=repo_root.resolve(),
+            staging_parent=staging_parent.resolve(),
+            harness=harness,
+            secret_patterns=patterns,
+        )
+        atomic_write_bytes(out, canonical_json_bytes(result))
+        if as_json:
+            console.print_json(json.dumps(result))
+        else:
+            statuses: dict[str, int] = {}
+            for outcome in result["outcomes"]:
+                status = str(outcome["status"])
+                statuses[status] = statuses.get(status, 0) + 1
+            console.print(f"Materialisation result written to {out}")
+            console.print(", ".join(f"{key}={value}" for key, value in sorted(statuses.items())))
+    except (OSError, TypeError, ValueError) as exc:
+        console.print(f"Error: {exc}")
+        code = ExitCode.DESTINATION_ERROR if "Unsafe" in str(exc) else ExitCode.INVALID_ARGS
+        _exit_with_error(code)
 
 
 @app.command()
