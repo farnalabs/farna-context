@@ -71,7 +71,12 @@ def test_binary_metadata_is_opaque_and_copy_is_safe(tmp_path: Path) -> None:
     )
     payload = {**pack, "pack_hash": "a" * 64}
     payload["pack_hash"] = TypedContextPack.canonical_hash(payload)
-    plan = materialise_typed_context(payload, repo_root=tmp_path, staging_parent=tmp_path / "stage")
+    plan = materialise_typed_context(
+        payload,
+        repo_root=tmp_path,
+        staging_parent=tmp_path / "stage",
+        secret_patterns=SecretPatterns(),
+    )
     assert plan["outcomes"][0]["status"] == "materialised"
     assert (Path(plan["output_dir"]) / "image.png").read_bytes() == b"PNG"
     assert pack["items"][0]["artefact_metadata"]["sha256"]
@@ -96,11 +101,43 @@ def test_reference_only_and_scoped_rule_report_correct_outcomes(tmp_path: Path) 
     )
     payload = {**pack, "pack_hash": "b" * 64}
     payload["pack_hash"] = TypedContextPack.canonical_hash(payload)
-    plan = materialise_typed_context(payload, repo_root=tmp_path, staging_parent=tmp_path / "stage")
+    plan = materialise_typed_context(
+        payload,
+        repo_root=tmp_path,
+        staging_parent=tmp_path / "stage",
+        secret_patterns=SecretPatterns(),
+    )
     outcomes = {item["item_id"]: item for item in plan["outcomes"]}
     assert outcomes["rule"]["status"] == "adapter_required"
     assert outcomes["audio"]["status"] == "materialised"
     assert not (Path(plan["output_dir"]) / "audio.wav").exists()
+
+
+def test_recomputed_dict_cannot_bypass_out_of_band_literal_policy(tmp_path: Path) -> None:
+    (tmp_path / "file.txt").write_text("safe", encoding="utf-8")
+    compiled = compile_typed_context_data(
+        {
+            "repo_root": str(tmp_path),
+            "items": [{"item_id": "file", "context_type": "general", "source_path": "file.txt"}],
+        },
+        secret_patterns=SecretPatterns(literal_values=["TOP-SECRET"]),
+    )
+    injected_bytes = b"TOP-SECRET"
+    tampered = {
+        **compiled,
+        "secret_literal_detector_count": 0,
+        "items": [
+            {
+                **compiled["items"][0],
+                "content_base64": base64.b64encode(injected_bytes).decode("ascii"),
+                "source_sha256": sha256_bytes(injected_bytes),
+            }
+        ],
+    }
+    tampered["pack_hash"] = TypedContextPack.canonical_hash(tampered)
+
+    with pytest.raises(TypeError, match="requires trusted secret policy"):
+        materialise_typed_context(tampered, repo_root=tmp_path, staging_parent=tmp_path / "stage")
 
 
 def test_compiled_literal_policy_stays_out_of_band_and_blocks_recomputed_pack(
@@ -180,6 +217,15 @@ def _hashed_payload(pack: dict[str, object]) -> dict[str, object]:
     return payload
 
 
+def _materialise_dict(pack: dict[str, object], tmp_path: Path) -> dict[str, object]:
+    return materialise_typed_context(
+        pack,
+        repo_root=tmp_path,
+        staging_parent=tmp_path / "stage",
+        secret_patterns=SecretPatterns(),
+    )
+
+
 def test_materialise_rejects_tampered_pack_before_creating_output(tmp_path: Path) -> None:
     (tmp_path / "file.txt").write_text("safe", encoding="utf-8")
     pack = compile_typed_context_data(
@@ -193,7 +239,7 @@ def test_materialise_rejects_tampered_pack_before_creating_output(tmp_path: Path
     )
 
     with pytest.raises(ValueError, match="output hash mismatch|secret-bearing"):
-        materialise_typed_context(tampered, repo_root=tmp_path, staging_parent=tmp_path / "stage")
+        _materialise_dict(tampered, tmp_path)
     assert not list((tmp_path / "stage").glob("typed-context-*"))
 
 
@@ -220,7 +266,12 @@ def test_materialise_rescans_injected_secret_bytes(tmp_path: Path) -> None:
     injected["pack_hash"] = TypedContextPack.canonical_hash(injected)
 
     with pytest.raises(ValueError, match="secret-bearing"):
-        materialise_typed_context(injected, repo_root=tmp_path, staging_parent=tmp_path / "stage")
+        materialise_typed_context(
+            injected,
+            repo_root=tmp_path,
+            staging_parent=tmp_path / "stage",
+            secret_patterns=SecretPatterns(named_detectors=["api_key"]),
+        )
 
 
 def test_general_context_size_boundary_is_enforced(tmp_path: Path) -> None:
@@ -263,9 +314,7 @@ def test_mount_mode_is_explicitly_adapter_required(tmp_path: Path) -> None:
             ],
         }
     )
-    plan = materialise_typed_context(
-        _hashed_payload(pack), repo_root=tmp_path, staging_parent=tmp_path / "stage"
-    )
+    plan = _materialise_dict(_hashed_payload(pack), tmp_path)
     assert plan["outcomes"][0]["status"] == "adapter_required"
     assert not list(Path(plan["output_dir"]).rglob("asset.bin"))
 
@@ -294,9 +343,7 @@ def test_duplicate_basenames_preserve_source_relative_paths(tmp_path: Path) -> N
             ],
         }
     )
-    plan = materialise_typed_context(
-        _hashed_payload(pack), repo_root=tmp_path, staging_parent=tmp_path / "stage"
-    )
+    plan = _materialise_dict(_hashed_payload(pack), tmp_path)
     output = Path(plan["output_dir"])
     assert (output / "one" / "same.txt").read_text(encoding="utf-8") == "one"
     assert (output / "two" / "same.txt").read_text(encoding="utf-8") == "two"
@@ -333,6 +380,7 @@ def test_shadow_file_overwrite_disabled_preserves_existing_bytes(tmp_path: Path)
         repo_root=tmp_path,
         staging_parent=tmp_path / "stage",
         ignore_checker=lambda _root, _destination: True,
+        secret_patterns=SecretPatterns(),
     )
 
     outcome = plan["outcomes"][0]
@@ -356,6 +404,7 @@ def test_shadow_file_overwrite_enabled_replaces_and_records_hashes(tmp_path: Pat
         repo_root=tmp_path,
         staging_parent=tmp_path / "stage",
         ignore_checker=lambda _root, _destination: True,
+        secret_patterns=SecretPatterns(),
     )
 
     outcome = plan["outcomes"][0]
@@ -363,6 +412,29 @@ def test_shadow_file_overwrite_enabled_replaces_and_records_hashes(tmp_path: Pat
     assert outcome["previous_sha256"] == sha256_bytes(b"existing shadow")
     assert outcome["sha256"] == sha256_bytes(b"new shadow")
     assert destination.read_bytes() == b"new shadow"
+
+
+def test_shadow_symlink_destination_is_rejected_before_following_victim(tmp_path: Path) -> None:
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    destination = victim / "AGENTS.md"
+    destination.write_bytes(b"victim")
+    generated = tmp_path / "generated"
+    try:
+        generated.symlink_to(victim, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"platform cannot create symlink: {exc}")
+
+    with pytest.raises(ValueError, match="Unsafe path"):
+        materialise_typed_context(
+            _shadow_pack(tmp_path, overwrite=True),
+            repo_root=tmp_path,
+            staging_parent=tmp_path / "stage",
+            ignore_checker=lambda _root, _destination: True,
+            secret_patterns=SecretPatterns(),
+        )
+
+    assert destination.read_bytes() == b"victim"
 
 
 def test_shadow_failure_rolls_back_prior_shadow_write(tmp_path: Path) -> None:
@@ -384,6 +456,7 @@ def test_shadow_failure_rolls_back_prior_shadow_write(tmp_path: Path) -> None:
             repo_root=tmp_path,
             staging_parent=tmp_path / "stage",
             ignore_checker=lambda _root, _destination: True,
+            secret_patterns=SecretPatterns(),
         )
     assert not (tmp_path / "generated" / "AGENTS.md").exists()
 
@@ -406,7 +479,12 @@ def test_general_materialise_rejects_oversized_payload(tmp_path: Path) -> None:
     }
     oversized["pack_hash"] = TypedContextPack.canonical_hash(oversized)
     with pytest.raises(ValueError, match="General context exceeds size limit"):
-        materialise_typed_context(oversized, repo_root=tmp_path, staging_parent=tmp_path / "stage")
+        materialise_typed_context(
+            oversized,
+            repo_root=tmp_path,
+            staging_parent=tmp_path / "stage",
+            secret_patterns=SecretPatterns(),
+        )
 
 
 def test_general_context_and_pack_hash_are_stable(tmp_path: Path) -> None:

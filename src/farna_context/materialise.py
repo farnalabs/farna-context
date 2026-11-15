@@ -199,6 +199,12 @@ def _shadow_plan(
         _raise_invalid_shadow_policy()
     policy = ShadowFilePolicy.model_validate(shadow_policy)
     shadow_destination = policy.destination
+    root = repo_root.resolve(strict=True)
+    relative_destination = validate_relative_path(shadow_destination)
+    raw_destination = root / relative_destination
+    # Validate the repository-relative components before any resolution can
+    # follow a symlink or junction to a different target.
+    reject_reparse_components(raw_destination)
     decision = shadow_file_preflight(repo_root, shadow_destination, ignore_checker=ignore_checker)
     if not decision.safe:
         return {
@@ -208,11 +214,9 @@ def _shadow_plan(
             "source_path": source,
         }
 
-    destination_path = (
-        repo_root.resolve(strict=True) / validate_relative_path(shadow_destination)
-    ).resolve()
+    destination_path = raw_destination.resolve()
     try:
-        destination_path.relative_to(repo_root.resolve(strict=True))
+        destination_path.relative_to(root)
     except ValueError as exc:
         raise ValueError("Shadow destination escapes repo root") from exc  # noqa: TRY003
     previous = destination_path.read_bytes() if destination_path.exists() else None
@@ -270,9 +274,16 @@ def materialise_typed_context(  # noqa: PLR0912, PLR0913, PLR0915
     """Materialise typed items and record a decision for every item."""
     compiled_patterns: SecretPatterns | None = None
     if isinstance(pack, TypedContextPack):
+        trusted_pack = True
         compiled_patterns = pack.secret_patterns
-        pack = pack.payload
-    pack_hash = pack.get("pack_hash")
+        pack_data = pack.payload
+    else:
+        trusted_pack = False
+        pack_data = pack
+        if secret_patterns is None:
+            raise TypeError("Typed context materialisation requires trusted secret policy")  # noqa: TRY003
+    pack = pack_data
+    pack_hash = pack_data.get("pack_hash")
     if not isinstance(pack_hash, str):
         raise TypeError("Invalid typed context pack")  # noqa: TRY003, TRY004
     TypedContextPack(pack, pack_hash).validate_integrity()
@@ -284,6 +295,8 @@ def materialise_typed_context(  # noqa: PLR0912, PLR0913, PLR0915
     literal_count = pack.get("secret_literal_detector_count", 0)
     if not isinstance(literal_count, int) or literal_count < 0:
         raise ValueError("Invalid typed context secret policy")  # noqa: TRY003
+    if literal_count and not trusted_pack and secret_patterns is None:
+        raise ValueError("Typed context literal policy requires trusted metadata")  # noqa: TRY003
     if literal_count and not patterns.literal_values:
         raise ValueError("Typed context literal secret policy is unavailable")  # noqa: TRY003
     if len(patterns.literal_values) != literal_count:
