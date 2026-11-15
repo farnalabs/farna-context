@@ -10,8 +10,9 @@ from typer.testing import CliRunner
 
 from src.farna_context.audit import audit_sources
 from src.farna_context.cli import app
-from src.farna_context.config import LocalConfig, SourceScope
+from src.farna_context.config import LocalConfig, SecretPatterns, SourceScope
 from src.farna_context.constants import ExitCode
+from src.farna_context.typed_context import TypedContextPack, compile_typed_context_data
 
 
 def _inputs(tmp_path: Path, source: bytes = b"safe\n") -> tuple[Path, Path, Path]:
@@ -154,6 +155,117 @@ def test_init_accepts_poc_contract_options_and_writes_record(tmp_path: Path) -> 
     assert record["repo_root"] == str(repo.resolve())
     assert record["revision"] == git_repo.head.commit.hexsha
     assert record["staging_parent"] == str(staging.resolve())
+
+
+def test_context_materialise_rejects_symlinked_staging_parent(tmp_path: Path) -> None:
+    """The typed CLI must reject a staging symlink before writing through it."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "context.md").write_text("context\n", encoding="utf-8")
+    pack_data = compile_typed_context_data(
+        {
+            "repo_root": str(repo),
+            "items": [
+                {
+                    "item_id": "context",
+                    "context_type": "artefact",
+                    "source_path": "context.md",
+                    "delivery_mode": "copy_to_staging",
+                }
+            ],
+        }
+    )
+    pack_data["pack_hash"] = TypedContextPack.canonical_hash(pack_data)
+    pack_path = tmp_path / "pack.json"
+    pack_path.write_text(json.dumps(pack_data), encoding="utf-8")
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps({"secret_patterns": SecretPatterns().model_dump(mode="json")}),
+        encoding="utf-8",
+    )
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    staging_link = tmp_path / "staging-link"
+    try:
+        staging_link.symlink_to(victim, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"platform cannot create symlink: {exc}")
+    out = tmp_path / "result.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "context-materialise",
+            "--pack",
+            str(pack_path),
+            "--policy",
+            str(policy_path),
+            "--repo-root",
+            str(repo),
+            "--staging-parent",
+            str(staging_link),
+            "--out",
+            str(out),
+        ],
+    )
+
+    assert result.exit_code == int(ExitCode.DESTINATION_ERROR)
+    assert "Unsafe output path" in result.stdout
+    assert not (victim / "context.md").exists()
+    assert not list(victim.iterdir())
+    assert not out.exists()
+
+
+def test_context_materialise_accepts_safe_staging_parent(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "context.md").write_text("context\n", encoding="utf-8")
+    pack_data = compile_typed_context_data(
+        {
+            "repo_root": str(repo),
+            "items": [
+                {
+                    "item_id": "context",
+                    "context_type": "artefact",
+                    "source_path": "context.md",
+                    "delivery_mode": "copy_to_staging",
+                }
+            ],
+        }
+    )
+    pack_data["pack_hash"] = TypedContextPack.canonical_hash(pack_data)
+    pack_path = tmp_path / "pack.json"
+    pack_path.write_text(json.dumps(pack_data), encoding="utf-8")
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps({"secret_patterns": SecretPatterns().model_dump(mode="json")}),
+        encoding="utf-8",
+    )
+    staging = tmp_path / "staging"
+    out = tmp_path / "result.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "context-materialise",
+            "--pack",
+            str(pack_path),
+            "--policy",
+            str(policy_path),
+            "--repo-root",
+            str(repo),
+            "--staging-parent",
+            str(staging),
+            "--out",
+            str(out),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert out.is_file()
+    result_data = json.loads(out.read_text(encoding="utf-8"))
+    output_dir = Path(result_data["output_dir"])
+    assert (output_dir / "context.md").read_text(encoding="utf-8") == "context\n"
 
 
 def test_compile_command_writes_pack(tmp_path: Path) -> None:

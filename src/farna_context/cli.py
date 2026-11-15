@@ -394,7 +394,7 @@ def context_materialise(  # noqa: PLR0913, PLR0917
         result = materialise_typed_context(
             pack_data,
             repo_root=repo_root.resolve(),
-            staging_parent=staging_parent.resolve(),
+            staging_parent=staging_parent,
             harness=harness,
             secret_patterns=patterns,
         )
