@@ -23,7 +23,7 @@ from typing import Self
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MAX_ARTEFACT_SIZE_BYTES = 10 * 1024 * 1024
-_MAX_GENERAL_SIZE_BYTES = 256 * 1024
+MAX_GENERAL_SIZE_BYTES = 256 * 1024
 _MIME_RE = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
 _ALLOWED_SHADOW_NAMES = frozenset({"AGENTS.md", "CLAUDE.md"})
 _CONTROL_CHAR_LIMIT = 32
@@ -143,7 +143,7 @@ class ContextItem(_StrictModel):
     artefact_metadata: ArtefactMetadata | None = None
     shadow_file_policy: ShadowFilePolicy | None = None
     instructional: bool = False
-    size_bytes: int = Field(default=0, ge=0, le=_MAX_GENERAL_SIZE_BYTES)
+    size_bytes: int = Field(default=0, ge=0, le=MAX_GENERAL_SIZE_BYTES)
 
     @field_validator("source_path")
     @classmethod

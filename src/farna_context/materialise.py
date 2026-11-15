@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -11,10 +12,16 @@ from typing import Any
 
 from .audit import AuditResult
 from .compile import _load_json as load_pack_json
-from .config import LocalConfig
-from .context_types import ResolvedDelivery, decide_shadow_file_cleanup, shadow_file_preflight
+from .config import LocalConfig, SecretPatterns
+from .context_types import (
+    MAX_GENERAL_SIZE_BYTES,
+    ResolvedDelivery,
+    decide_shadow_file_cleanup,
+    shadow_file_preflight,
+)
 from .manifest import generate_manifest
-from .typed_context import DeliveryMode
+from .secrets import scan_bytes
+from .typed_context import DeliveryMode, TypedContextPack
 from .utils import (
     atomic_write_bytes,
     canonical_json_bytes,
@@ -24,6 +31,10 @@ from .utils import (
     sha256_bytes,
     validate_relative_path,
 )
+
+
+def _raise_collision() -> None:
+    raise ValueError("Artefact destination collision")  # noqa: TRY003
 
 
 class MaterialiseResult:
@@ -79,8 +90,22 @@ def materialise_files(
     return result
 
 
-def _load_pack(pack_path: Path) -> dict[str, Any]:
-    """Load and validate a compiled pack before creating any output."""
+def _decode_content(item: dict[str, Any]) -> bytes:
+    encoded = item.get("content_base64")
+    if not isinstance(encoded, str):
+        raise TypeError("Context pack contains invalid output content")  # noqa: TRY003
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Context pack contains invalid output content") from exc  # noqa: TRY003
+
+
+def _load_pack(
+    pack_path: Path,
+    *,
+    secret_patterns: SecretPatterns | None = None,
+) -> dict[str, Any]:
+    """Load, hash-check, decode, and rescan a compiled pack before output."""
     pack, _ = load_pack_json(pack_path)
     selected = pack.get("selected_sources")
     pack_hash = pack.get("pack_hash")
@@ -91,20 +116,27 @@ def _load_pack(pack_path: Path) -> dict[str, Any]:
     )
     if pack_hash != expected_hash:
         raise ValueError("Context pack hash mismatch")  # noqa: TRY003
+    patterns = secret_patterns or SecretPatterns()
+    seen_paths: set[str] = set()
     for item in selected:
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
             raise ValueError("Context pack contains an invalid output path")  # noqa: TRY003, TRY004
-        validate_relative_path(item["path"])
-        if not isinstance(item.get("content_base64"), str) or not isinstance(
-            item.get("emitted_sha256"), str
-        ):
-            raise ValueError("Context pack contains an invalid output")  # noqa: TRY003, TRY004
-        try:
-            content = base64.b64decode(item["content_base64"], validate=True)
-        except ValueError as exc:
-            raise ValueError("Context pack contains invalid output content") from exc  # noqa: TRY003
-        if sha256_bytes(content) != item["emitted_sha256"]:
+        relative = validate_relative_path(item["path"])
+        if relative in seen_paths:
+            raise ValueError("Context pack contains duplicate output paths")  # noqa: TRY003
+        seen_paths.add(relative)
+        emitted_hash = item.get("emitted_sha256")
+        if not isinstance(emitted_hash, str):
+            raise TypeError("Context pack contains an invalid output")  # noqa: TRY003
+        content = _decode_content(item)
+        if sha256_bytes(content) != emitted_hash:
             raise ValueError("Context pack output hash mismatch")  # noqa: TRY003
+        if scan_bytes(content, relative, patterns):
+            raise ValueError("Context pack contains secret-bearing output")  # noqa: TRY003
+        if item.get("context_type") == "general" and len(content) > MAX_GENERAL_SIZE_BYTES:
+            raise ValueError("General context exceeds size limit")  # noqa: TRY003
+        item["path"] = relative
+        item["_decoded_content"] = content
     return pack
 
 
@@ -144,7 +176,7 @@ def materialise_pack(pack_path: Path, parent: Path, plan_path: Path) -> dict[str
     return plan
 
 
-def materialise_typed_context(  # noqa: PLR0912
+def materialise_typed_context(  # noqa: PLR0912, PLR0915
     pack: dict[str, Any],
     *,
     repo_root: Path,
@@ -156,14 +188,29 @@ def materialise_typed_context(  # noqa: PLR0912
     pack_hash = pack.get("pack_hash")
     if not isinstance(pack_hash, str):
         raise TypeError("Invalid typed context pack")  # noqa: TRY003, TRY004
+    TypedContextPack(pack, pack_hash).validate_integrity()
+    patterns = SecretPatterns(named_detectors=list(pack.get("secret_detector_names", [])))
+    decoded_items: list[tuple[dict[str, Any], bytes]] = []
+    for raw_item in pack.get("items", []):
+        if not isinstance(raw_item, dict):
+            raise TypeError("Invalid typed context item")  # noqa: TRY003, TRY004, TRY301
+        content = _decode_content(raw_item)
+        source = str(raw_item.get("source_path", ""))
+        declared_hash = raw_item.get("source_sha256")
+        if not isinstance(declared_hash, str) or sha256_bytes(content) != declared_hash:
+            raise ValueError("Typed context pack output hash mismatch")  # noqa: TRY003
+        if scan_bytes(content, source, patterns):
+            raise ValueError("Typed context pack contains secret-bearing output")  # noqa: TRY003
+        if raw_item.get("context_type") == "general" and len(content) > MAX_GENERAL_SIZE_BYTES:
+            raise ValueError("General context exceeds size limit")  # noqa: TRY003
+        decoded_items.append((raw_item, content))
     prepare_output_directory(staging_parent)
     operation_dir = Path(tempfile.mkdtemp(prefix="typed-context-", dir=staging_parent))
     outcomes: list[dict[str, Any]] = []
     general: list[str] = []
     try:
-        for item in pack.get("items", []):
-            if not isinstance(item, dict):
-                raise TypeError("Invalid typed context item")  # noqa: TRY003, TRY004, TRY301
+        used_destinations: set[str] = set()
+        for item, content in decoded_items:
             item_id = str(item["item_id"])
             item_type = str(item["context_type"])
             source = str(item["source_path"])
@@ -178,18 +225,27 @@ def materialise_typed_context(  # noqa: PLR0912
                     else "scoped rule retained"
                 )
             elif item_type == "general":
-                content = base64.b64decode(str(item["content_base64"]), validate=True).decode(
-                    "utf-8"
-                )
-                general.append(content)
+                try:
+                    general.append(content.decode("utf-8"))
+                except UnicodeDecodeError as exc:
+                    raise ValueError("General context is not valid UTF-8") from exc  # noqa: TRY003
             elif item_type == "artefact":
                 if mode == DeliveryMode.REFERENCE_ONLY.value:
                     reason = "reference recorded; content not copied"
-                elif mode == DeliveryMode.COPY_TO_STAGING.value:
-                    destination = operation_dir / Path(source).name
-                    atomic_write_bytes(
-                        destination, base64.b64decode(str(item["content_base64"]), validate=True)
+                elif mode == DeliveryMode.MOUNT_IF_SUPPORTED.value:
+                    status, reason = (
+                        "adapter_required",
+                        "requested mount delivery requires an adapter",
                     )
+                elif mode == DeliveryMode.COPY_TO_STAGING.value:
+                    destination_name = source
+                    if destination_name in used_destinations:
+                        _raise_collision()
+                    used_destinations.add(destination_name)
+                    destination = operation_dir / validate_relative_path(destination_name)
+                    prepare_output_directory(destination.parent)
+                    atomic_write_bytes(destination, content)
+                    reason = "copied to staging"
                 else:
                     status, reason = (
                         "adapter_required",
@@ -204,11 +260,11 @@ def materialise_typed_context(  # noqa: PLR0912
                     status, reason = "blocked", decision.reason
                 else:
                     destination_path = repo_root / shadow_destination
+                    if destination_path.exists():
+                        destination_path = safe_source_path(repo_root, shadow_destination)
+                    reject_reparse_components(destination_path.parent)
                     prepare_output_directory(destination_path.parent)
-                    atomic_write_bytes(
-                        destination_path,
-                        base64.b64decode(str(item["content_base64"]), validate=True),
-                    )
+                    atomic_write_bytes(destination_path, content)
                     outcomes.append(
                         {"item_id": item_id, "status": status, "destination": shadow_destination}
                     )

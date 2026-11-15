@@ -9,11 +9,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .compile import _load_json
 from .config import SecretPatterns
-from .context_types import ContextType, RuleScope
+from .context_types import MAX_GENERAL_SIZE_BYTES, ContextType, RuleScope, ShadowFilePolicy
 from .secrets import scan_bytes
 from .utils import canonical_json_bytes, safe_source_path, sha256_bytes, validate_relative_path
 
@@ -36,6 +36,15 @@ class TypedContextItem(BaseModel):
     delivery_mode: DeliveryMode | None = None
     selected: bool = True
     required: bool = False
+    shadow_file_policy: ShadowFilePolicy | None = None
+
+    @model_validator(mode="after")
+    def validate_shadow_policy(self) -> TypedContextItem:
+        if self.context_type is ContextType.SHADOW_FILE and self.shadow_file_policy is None:
+            raise ValueError("shadow_file items require shadow_file_policy")  # noqa: TRY003
+        if self.context_type is not ContextType.SHADOW_FILE and self.shadow_file_policy is not None:
+            raise ValueError("only shadow_file items may have shadow_file_policy")  # noqa: TRY003
+        return self
 
 
 class TypedContextManifest(BaseModel):
@@ -50,7 +59,18 @@ class TypedContextPack:
     payload: dict[str, Any]
     pack_hash: str
 
+    @staticmethod
+    def canonical_hash(payload: dict[str, Any]) -> str:
+        unsigned = {k: v for k, v in payload.items() if k != "pack_hash"}
+        return sha256_bytes(canonical_json_bytes(unsigned))
+
+    def validate_integrity(self) -> None:
+        expected = self.canonical_hash(self.payload)
+        if self.pack_hash != expected or self.payload.get("pack_hash") != self.pack_hash:
+            raise ValueError("Typed context pack hash mismatch")  # noqa: TRY003
+
     def to_json(self) -> bytes:
+        self.validate_integrity()
         return canonical_json_bytes(self.payload)
 
 
@@ -140,6 +160,16 @@ def compile_typed_context_data(
                 raise ValueError(f"Secret detected in required typed source: {path}")  # noqa: TRY003
             omitted.append(omission)
             continue
+        if item.context_type is ContextType.GENERAL and len(data) > MAX_GENERAL_SIZE_BYTES:
+            omission = {
+                "item_id": item.item_id,
+                "context_type": item.context_type.value,
+                "reason": "general_context_too_large",
+            }
+            if item.required:
+                raise ValueError("Required general context exceeds size limit")  # noqa: TRY003
+            omitted.append(omission)
+            continue
         record: dict[str, Any] = {
             "item_id": item.item_id,
             "context_type": item.context_type.value,
@@ -157,10 +187,18 @@ def compile_typed_context_data(
                 source, data, delivery or DeliveryMode.REFERENCE_ONLY
             )
         if item.context_type is ContextType.SHADOW_FILE:
-            record["shadow_destination"] = path
+            if item.shadow_file_policy is None:
+                raise ValueError("Shadow file items require a shadow file policy")  # noqa: TRY003
+            record["shadow_destination"] = item.shadow_file_policy.destination
+            record["shadow_policy"] = item.shadow_file_policy.model_dump(mode="json")
         selected.append(record)
 
-    return {"schema_version": "typed-context-alpha-1", "items": selected, "omitted": omitted}
+    return {
+        "schema_version": "typed-context-alpha-1",
+        "items": selected,
+        "omitted": omitted,
+        "secret_detector_names": sorted(patterns.named_detectors),
+    }
 
 
 def compile_typed_context(
@@ -178,8 +216,9 @@ def compile_typed_context(
     patterns = SecretPatterns.model_validate(secret_data if isinstance(secret_data, dict) else {})
     typed = compile_typed_context_data(data, secret_patterns=patterns)
     identity = {"manifest": typed, "manifest_sha256": sha256_bytes(canonical_json_bytes(data))}
-    pack_hash = sha256_bytes(canonical_json_bytes(identity))
-    payload = {**typed, "pack_hash": pack_hash}
+    payload = {**typed, "identity": identity}
+    pack_hash = TypedContextPack.canonical_hash(payload)
+    payload["pack_hash"] = pack_hash
     if manifest_path.read_bytes() != manifest_bytes:
         raise ValueError("Typed context manifest changed during compilation")  # noqa: TRY003
     output_path.parent.mkdir(parents=True, exist_ok=True)
