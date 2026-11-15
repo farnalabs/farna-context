@@ -103,6 +103,56 @@ def test_reference_only_and_scoped_rule_report_correct_outcomes(tmp_path: Path) 
     assert not (Path(plan["output_dir"]) / "audio.wav").exists()
 
 
+def test_compiled_literal_policy_stays_out_of_band_and_blocks_recomputed_pack(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "repo_root": str(tmp_path),
+                "items": [
+                    {
+                        "item_id": "file",
+                        "context_type": "general",
+                        "source_path": "file.txt",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "file.txt").write_text("safe", encoding="utf-8")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"secret_patterns": {"literal_values": ["TOP-SECRET"]}}),
+        encoding="utf-8",
+    )
+    compiled = compile_typed_context(manifest_path, tmp_path / "pack.json", config_path=config_path)
+    serialised = compiled.to_json().decode("utf-8")
+    assert "TOP-SECRET" not in serialised
+    assert "TOP-SECRET" not in json.dumps(compiled.payload)
+
+    injected_bytes = b"TOP-SECRET"
+    injected = {
+        **compiled.payload,
+        "items": [
+            {
+                **compiled.payload["items"][0],
+                "content_base64": base64.b64encode(injected_bytes).decode("ascii"),
+                "source_sha256": sha256_bytes(injected_bytes),
+            }
+        ],
+    }
+    injected["pack_hash"] = TypedContextPack.canonical_hash(injected)
+    with pytest.raises(ValueError, match="secret-bearing"):
+        materialise_typed_context(
+            TypedContextPack(injected, injected["pack_hash"], compiled.secret_patterns),
+            repo_root=tmp_path,
+            staging_parent=tmp_path / "stage",
+        )
+
+
 def test_secret_artefact_is_omitted_without_leaking_value(tmp_path: Path) -> None:
     (tmp_path / "secret.bin").write_bytes(b"api_key=do-not-leak")
     pack = compile_typed_context_data(
@@ -313,6 +363,29 @@ def test_shadow_file_overwrite_enabled_replaces_and_records_hashes(tmp_path: Pat
     assert outcome["previous_sha256"] == sha256_bytes(b"existing shadow")
     assert outcome["sha256"] == sha256_bytes(b"new shadow")
     assert destination.read_bytes() == b"new shadow"
+
+
+def test_shadow_failure_rolls_back_prior_shadow_write(tmp_path: Path) -> None:
+    pack = _shadow_pack(tmp_path, overwrite=False)
+    pack["items"].append(
+        {
+            "item_id": "invalid",
+            "context_type": "shadow_file",
+            "source_path": "shadow.md",
+            "shadow_policy": {"destination": "generated/not-allowed.txt", "overwrite": False},
+            "content_base64": base64.b64encode(b"invalid").decode("ascii"),
+            "source_sha256": sha256_bytes(b"invalid"),
+        }
+    )
+    pack["pack_hash"] = TypedContextPack.canonical_hash(pack)
+    with pytest.raises(ValueError):
+        materialise_typed_context(
+            pack,
+            repo_root=tmp_path,
+            staging_parent=tmp_path / "stage",
+            ignore_checker=lambda _root, _destination: True,
+        )
+    assert not (tmp_path / "generated" / "AGENTS.md").exists()
 
 
 def test_general_materialise_rejects_oversized_payload(tmp_path: Path) -> None:

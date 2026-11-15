@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import mimetypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -58,6 +58,10 @@ class TypedContextManifest(BaseModel):
 class TypedContextPack:
     payload: dict[str, Any]
     pack_hash: str
+    # Literal detector values never enter payload, hashes, or receipts.
+    secret_patterns: SecretPatterns = field(
+        default_factory=SecretPatterns, repr=False, compare=False
+    )
 
     @staticmethod
     def canonical_hash(payload: dict[str, Any]) -> str:
@@ -198,6 +202,9 @@ def compile_typed_context_data(
         "items": selected,
         "omitted": omitted,
         "secret_detector_names": sorted(patterns.named_detectors),
+        # Literal values are deliberately kept out of the pack.  The count is
+        # a fail-closed marker; materialisation receives the values out of band.
+        "secret_literal_detector_count": len(patterns.literal_values),
     }
 
 
@@ -223,7 +230,7 @@ def compile_typed_context(
         raise ValueError("Typed context manifest changed during compilation")  # noqa: TRY003
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(canonical_json_bytes(payload))
-    return TypedContextPack(payload, pack_hash)
+    return TypedContextPack(payload, pack_hash, patterns)
 
 
 __all__ = [
