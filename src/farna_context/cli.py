@@ -13,6 +13,7 @@ from .audit import AuditContext, AuditResult, audit_sources, collect_audit_resul
 from .compile import _load_json, compile_manifest
 from .config import LocalConfig, SecretPatterns, load_config, save_config
 from .constants import CONFIG_FILE, ExitCode, OutcomeStatus, RequestedBy
+from .dogfood import prepare_dogfood
 from .exceptions import (
     CompilationError,
     InputChangedError,
@@ -618,6 +619,39 @@ def receipt(  # noqa: PLR0913, PLR0917
         raise
     except Exception as e:
         _handle_generic_error(e, ExitCode.RECEIPT_ERROR)
+
+
+@app.command("dogfood-prepare")
+def dogfood_prepare(  # noqa: PLR0913, PLR0917
+    repo_root: Annotated[Path, typer.Option("--repo-root", exists=True, file_okay=False)],
+    task: Annotated[Path, typer.Option("--task", exists=True, readable=True)],
+    profile: Annotated[str, typer.Option("--profile")] = "improve-internal-docs",
+    pipeline: Annotated[str | None, typer.Option("--pipeline")] = None,
+    harness: Annotated[str, typer.Option("--harness")] = "opencode",
+    out: Annotated[Path, typer.Option("--out")] = Path(".farna-context/dogfood"),
+    staging_parent: Annotated[Path, typer.Option("--staging-parent")] = Path(
+        ".farna-context/staging"
+    ),
+    private_paths: Annotated[
+        str | None, typer.Option("--private-paths", envvar="FARNA_CONTEXT_PRIVATE_PATHS")
+    ] = None,
+) -> None:
+    """Prepare context artefacts and a launch command without running OpenCode."""
+    try:
+        result = prepare_dogfood(
+            repo_root=repo_root,
+            task_path=task,
+            profile=profile,
+            pipeline=pipeline,
+            harness=harness,
+            out=out,
+            staging_parent=staging_parent,
+            private_paths=private_paths,
+        )
+        console.print_json(json.dumps(result))
+    except (OSError, TypeError, ValueError) as exc:
+        console.print(f"Error: {exc}")
+        _exit_with_error(ExitCode.COMPILATION_ERROR)
 
 
 @app.command()
