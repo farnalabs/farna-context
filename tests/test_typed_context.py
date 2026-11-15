@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from src.farna_context.config import SecretPatterns
-from src.farna_context.context_types import ContextType, RuleScope
+from src.farna_context.context_types import ContextType, RuleScope, ShadowFilePolicy
 from src.farna_context.materialise import materialise_typed_context
 from src.farna_context.typed_context import (
     DeliveryMode,
@@ -250,6 +250,69 @@ def test_duplicate_basenames_preserve_source_relative_paths(tmp_path: Path) -> N
     output = Path(plan["output_dir"])
     assert (output / "one" / "same.txt").read_text(encoding="utf-8") == "one"
     assert (output / "two" / "same.txt").read_text(encoding="utf-8") == "two"
+
+
+def _shadow_pack(repo: Path, *, overwrite: bool) -> dict[str, object]:
+    (repo / "shadow.md").write_text("new shadow", encoding="utf-8")
+    pack = compile_typed_context_data(
+        {
+            "repo_root": str(repo),
+            "items": [
+                {
+                    "item_id": "shadow",
+                    "context_type": "shadow_file",
+                    "source_path": "shadow.md",
+                    "shadow_file_policy": {
+                        "destination": "generated/AGENTS.md",
+                        "overwrite": overwrite,
+                    },
+                }
+            ],
+        }
+    )
+    return _hashed_payload(pack)
+
+
+def test_shadow_file_overwrite_disabled_preserves_existing_bytes(tmp_path: Path) -> None:
+    destination = tmp_path / "generated" / "AGENTS.md"
+    destination.parent.mkdir()
+    destination.write_bytes(b"existing shadow")
+
+    plan = materialise_typed_context(
+        _shadow_pack(tmp_path, overwrite=False),
+        repo_root=tmp_path,
+        staging_parent=tmp_path / "stage",
+        ignore_checker=lambda _root, _destination: True,
+    )
+
+    outcome = plan["outcomes"][0]
+    assert outcome["status"] == "blocked"
+    assert outcome["reason"] == "destination_exists_overwrite_disabled"
+    assert destination.read_bytes() == b"existing shadow"
+
+
+def test_shadow_file_overwrite_enabled_replaces_and_records_hashes(tmp_path: Path) -> None:
+    destination = tmp_path / "generated" / "CLAUDE.md"
+    destination.parent.mkdir()
+    destination.write_bytes(b"existing shadow")
+
+    pack = _shadow_pack(tmp_path, overwrite=True)
+    pack["items"][0]["shadow_policy"] = ShadowFilePolicy(
+        destination="generated/CLAUDE.md", overwrite=True
+    ).model_dump(mode="json")
+    pack["pack_hash"] = TypedContextPack.canonical_hash(pack)
+    plan = materialise_typed_context(
+        pack,
+        repo_root=tmp_path,
+        staging_parent=tmp_path / "stage",
+        ignore_checker=lambda _root, _destination: True,
+    )
+
+    outcome = plan["outcomes"][0]
+    assert outcome["status"] == "materialised"
+    assert outcome["previous_sha256"] == sha256_bytes(b"existing shadow")
+    assert outcome["sha256"] == sha256_bytes(b"new shadow")
+    assert destination.read_bytes() == b"new shadow"
 
 
 def test_general_materialise_rejects_oversized_payload(tmp_path: Path) -> None:

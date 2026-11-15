@@ -16,6 +16,7 @@ from .config import LocalConfig, SecretPatterns
 from .context_types import (
     MAX_GENERAL_SIZE_BYTES,
     ResolvedDelivery,
+    ShadowFilePolicy,
     decide_shadow_file_cleanup,
     shadow_file_preflight,
 )
@@ -176,6 +177,60 @@ def materialise_pack(pack_path: Path, parent: Path, plan_path: Path) -> dict[str
     return plan
 
 
+def _raise_invalid_shadow_policy() -> None:
+    raise TypeError("Shadow file item has invalid policy")  # noqa: TRY003
+
+
+def _shadow_file_outcome(
+    item: dict[str, Any],
+    content: bytes,
+    repo_root: Path,
+    ignore_checker: Callable[[Path, str], bool] | None,
+) -> dict[str, Any]:
+    """Apply one shadow-file policy after all filesystem safety checks."""
+    item_id = str(item["item_id"])
+    source = str(item["source_path"])
+    shadow_policy = item.get("shadow_policy")
+    if not isinstance(shadow_policy, dict):
+        _raise_invalid_shadow_policy()
+    policy = ShadowFilePolicy.model_validate(shadow_policy)
+    shadow_destination = policy.destination
+    decision = shadow_file_preflight(repo_root, shadow_destination, ignore_checker=ignore_checker)
+    if not decision.safe:
+        return {
+            "item_id": item_id,
+            "status": "blocked",
+            "reason": decision.reason,
+            "source_path": source,
+        }
+
+    destination_path = repo_root / validate_relative_path(shadow_destination)
+    existing_hash: str | None = None
+    if destination_path.exists():
+        if not policy.overwrite:
+            return {
+                "item_id": item_id,
+                "status": "blocked",
+                "reason": "destination_exists_overwrite_disabled",
+                "source_path": source,
+            }
+        destination_path = safe_source_path(repo_root, shadow_destination)
+        existing_hash = sha256_bytes(destination_path.read_bytes())
+    reject_reparse_components(destination_path.parent)
+    prepare_output_directory(destination_path.parent)
+    atomic_write_bytes(destination_path, content)
+    outcome: dict[str, Any] = {
+        "item_id": item_id,
+        "status": "materialised",
+        "destination": shadow_destination,
+        "sha256": sha256_bytes(content),
+        "generated": existing_hash is None,
+    }
+    if existing_hash is not None:
+        outcome["previous_sha256"] = existing_hash
+    return outcome
+
+
 def materialise_typed_context(  # noqa: PLR0912, PLR0915
     pack: dict[str, Any],
     *,
@@ -252,23 +307,15 @@ def materialise_typed_context(  # noqa: PLR0912, PLR0915
                         "requested artefact delivery is unsupported",
                     )
             elif item_type == "shadow_file":
-                shadow_destination = str(item.get("shadow_destination", source))
-                decision = shadow_file_preflight(
-                    repo_root, shadow_destination, ignore_checker=ignore_checker
-                )
-                if not decision.safe:
-                    status, reason = "blocked", decision.reason
-                else:
-                    destination_path = repo_root / shadow_destination
-                    if destination_path.exists():
-                        destination_path = safe_source_path(repo_root, shadow_destination)
-                    reject_reparse_components(destination_path.parent)
-                    prepare_output_directory(destination_path.parent)
-                    atomic_write_bytes(destination_path, content)
-                    outcomes.append(
-                        {"item_id": item_id, "status": status, "destination": shadow_destination}
+                outcomes.append(
+                    _shadow_file_outcome(
+                        item,
+                        content,
+                        repo_root,
+                        ignore_checker,
                     )
-                    continue
+                )
+                continue
             outcomes.append(
                 {"item_id": item_id, "status": status, "reason": reason, "source_path": source}
             )
