@@ -15,7 +15,13 @@ from .compile import _load_json
 from .config import SecretPatterns
 from .context_types import MAX_GENERAL_SIZE_BYTES, ContextType, RuleScope, ShadowFilePolicy
 from .secrets import scan_bytes
-from .utils import canonical_json_bytes, safe_source_path, sha256_bytes, validate_relative_path
+from .utils import (
+    atomic_write_bytes,
+    canonical_json_bytes,
+    safe_source_path,
+    sha256_bytes,
+    validate_relative_path,
+)
 
 
 class DeliveryMode(StrEnum):
@@ -228,9 +234,86 @@ def compile_typed_context(
     payload["pack_hash"] = pack_hash
     if manifest_path.read_bytes() != manifest_bytes:
         raise ValueError("Typed context manifest changed during compilation")  # noqa: TRY003
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(canonical_json_bytes(payload))
+    atomic_write_bytes(output_path, canonical_json_bytes(payload))
     return TypedContextPack(payload, pack_hash, patterns)
+
+
+def load_typed_context_manifest(path: Path) -> dict[str, Any]:
+    """Load a typed context manifest without exposing secret-bearing values."""
+    data, _ = _load_json(path)
+    _typed_manifest(data)
+    return data
+
+
+def preview_typed_context_data(
+    manifest_data: dict[str, Any],
+    *,
+    repo_root: Path | None = None,
+    secret_patterns: SecretPatterns | None = None,
+) -> dict[str, Any]:
+    """Return typed selection decisions without writing a pack or source content."""
+    manifest = _typed_manifest(manifest_data)
+    root = (repo_root or Path(manifest.repo_root)).resolve(strict=True)
+    patterns = secret_patterns or SecretPatterns()
+    decisions: list[dict[str, Any]] = []
+    for item in sorted(manifest.items, key=lambda value: value.item_id):
+        if not item.selected:
+            decisions.append(
+                {
+                    "item_id": item.item_id,
+                    "context_type": item.context_type.value,
+                    "decision": "omitted",
+                    "reason": "policy_excluded",
+                }
+            )
+            continue
+        try:
+            source = safe_source_path(root, validate_relative_path(item.source_path))
+            data = source.read_bytes()
+        except (OSError, ValueError):
+            decision = "blocked" if item.required else "omitted"
+            decisions.append(
+                {
+                    "item_id": item.item_id,
+                    "context_type": item.context_type.value,
+                    "decision": decision,
+                    "reason": "source_unavailable",
+                }
+            )
+            continue
+        findings = scan_bytes(data, item.source_path, patterns)
+        if findings:
+            decisions.append(
+                {
+                    "item_id": item.item_id,
+                    "context_type": item.context_type.value,
+                    "decision": "blocked" if item.required else "omitted",
+                    "reason": "secret_pattern_match",
+                    "detectors": sorted({finding.detector for finding in findings}),
+                }
+            )
+            continue
+        if item.context_type is ContextType.RULE:
+            reason = "scoped rule requires adapter at materialisation"
+            decision = "adapter_required"
+        else:
+            reason = "source is valid and selected"
+            decision = "selected"
+        decisions.append(
+            {
+                "item_id": item.item_id,
+                "context_type": item.context_type.value,
+                "decision": decision,
+                "reason": reason,
+            }
+        )
+    return {
+        "schema_version": "typed-context-preview-alpha-1",
+        "repo_root": str(root),
+        "decisions": decisions,
+        "secret_detector_names": sorted(patterns.named_detectors),
+        "secret_literal_detector_count": len(patterns.literal_values),
+    }
 
 
 __all__ = [
@@ -240,4 +323,6 @@ __all__ = [
     "TypedContextPack",
     "compile_typed_context",
     "compile_typed_context_data",
+    "load_typed_context_manifest",
+    "preview_typed_context_data",
 ]

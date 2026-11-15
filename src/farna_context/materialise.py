@@ -21,6 +21,7 @@ from .context_types import (
     shadow_file_preflight,
 )
 from .manifest import generate_manifest
+from .opencode_adapter import materialise_opencode_rules
 from .secrets import scan_bytes
 from .typed_context import DeliveryMode, TypedContextPack
 from .utils import (
@@ -319,6 +320,7 @@ def materialise_typed_context(  # noqa: PLR0912, PLR0913, PLR0915
     operation_dir = Path(tempfile.mkdtemp(prefix="typed-context-", dir=staging_parent))
     outcomes: list[dict[str, Any]] = []
     general: list[str] = []
+    opencode_rules: list[tuple[dict[str, Any], bytes]] = []
     applied_shadows: list[tuple[Path, str, bytes | None, str | None]] = []
     try:
         used_destinations: set[str] = set()
@@ -359,12 +361,11 @@ def materialise_typed_context(  # noqa: PLR0912, PLR0913, PLR0915
             status = "materialised"
             reason: str | None = None
             if item_type == "rule":
-                status = "adapter_required" if harness == "opencode" else "materialised"
-                reason = (
-                    "harness lacks native scoped-rule capability"
-                    if status == "adapter_required"
-                    else "scoped rule retained"
-                )
+                if harness == "opencode":
+                    opencode_rules.append((item, content))
+                    continue
+                status = "materialised"
+                reason = "scoped rule retained"
             elif item_type == "general":
                 try:
                     general.append(content.decode("utf-8"))
@@ -406,6 +407,32 @@ def materialise_typed_context(  # noqa: PLR0912, PLR0913, PLR0915
             outcomes.append(
                 {"item_id": item_id, "status": status, "reason": reason, "source_path": source}
             )
+        if harness == "opencode" and opencode_rules:
+            adapter_result = materialise_opencode_rules(opencode_rules, operation_dir)
+            adapter_outcome: dict[str, Any] = {
+                "item_id": "opencode-rules-adapter",
+                "status": adapter_result.status.value,
+                "reason": adapter_result.reason,
+                "capability": adapter_result.capability.to_dict(),
+            }
+            if adapter_result.artifact_path is not None:
+                adapter_outcome["artifact_path"] = adapter_result.artifact_path
+            if adapter_result.rule_ids:
+                adapter_outcome["rule_ids"] = list(adapter_result.rule_ids)
+            outcomes.append(adapter_outcome)
+            for item_id in adapter_result.rule_ids:
+                outcomes.append(
+                    {
+                        "item_id": item_id,
+                        "status": adapter_result.status.value,
+                        "reason": adapter_result.reason,
+                        "source_path": next(
+                            str(item["source_path"])
+                            for item, _content in opencode_rules
+                            if str(item["item_id"]) == item_id
+                        ),
+                    }
+                )
         return {
             "schema_version": "typed-materialisation-alpha-1",
             "pack_hash": pack_hash,

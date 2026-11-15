@@ -108,9 +108,13 @@ def test_reference_only_and_scoped_rule_report_correct_outcomes(tmp_path: Path) 
         secret_patterns=SecretPatterns(),
     )
     outcomes = {item["item_id"]: item for item in plan["outcomes"]}
-    assert outcomes["rule"]["status"] == "adapter_required"
+    assert outcomes["rule"]["status"] == "materialised"
     assert outcomes["audio"]["status"] == "materialised"
+    assert outcomes["opencode-rules-adapter"]["status"] == "materialised"
+    assert outcomes["opencode-rules-adapter"]["capability"]["native_path_glob_rules"] is False
     assert not (Path(plan["output_dir"]) / "audio.wav").exists()
+    rule_file = next((Path(plan["output_dir"]) / "opencode-rules").glob("*.md"))
+    assert '  - "*.py"' in rule_file.read_text(encoding="utf-8")
 
 
 def test_recomputed_dict_cannot_bypass_out_of_band_literal_policy(tmp_path: Path) -> None:

@@ -10,8 +10,9 @@ from typer.testing import CliRunner
 
 from src.farna_context.audit import audit_sources
 from src.farna_context.cli import app
-from src.farna_context.config import LocalConfig, SourceScope
+from src.farna_context.config import LocalConfig, SecretPatterns, SourceScope
 from src.farna_context.constants import ExitCode
+from src.farna_context.typed_context import TypedContextPack, compile_typed_context_data
 
 
 def _inputs(tmp_path: Path, source: bytes = b"safe\n") -> tuple[Path, Path, Path]:
@@ -156,6 +157,117 @@ def test_init_accepts_poc_contract_options_and_writes_record(tmp_path: Path) -> 
     assert record["staging_parent"] == str(staging.resolve())
 
 
+def test_context_materialise_rejects_symlinked_staging_parent(tmp_path: Path) -> None:
+    """The typed CLI must reject a staging symlink before writing through it."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "context.md").write_text("context\n", encoding="utf-8")
+    pack_data = compile_typed_context_data(
+        {
+            "repo_root": str(repo),
+            "items": [
+                {
+                    "item_id": "context",
+                    "context_type": "artefact",
+                    "source_path": "context.md",
+                    "delivery_mode": "copy_to_staging",
+                }
+            ],
+        }
+    )
+    pack_data["pack_hash"] = TypedContextPack.canonical_hash(pack_data)
+    pack_path = tmp_path / "pack.json"
+    pack_path.write_text(json.dumps(pack_data), encoding="utf-8")
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps({"secret_patterns": SecretPatterns().model_dump(mode="json")}),
+        encoding="utf-8",
+    )
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    staging_link = tmp_path / "staging-link"
+    try:
+        staging_link.symlink_to(victim, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"platform cannot create symlink: {exc}")
+    out = tmp_path / "result.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "context-materialise",
+            "--pack",
+            str(pack_path),
+            "--policy",
+            str(policy_path),
+            "--repo-root",
+            str(repo),
+            "--staging-parent",
+            str(staging_link),
+            "--out",
+            str(out),
+        ],
+    )
+
+    assert result.exit_code == int(ExitCode.DESTINATION_ERROR)
+    assert "Unsafe output path" in result.stdout
+    assert not (victim / "context.md").exists()
+    assert not list(victim.iterdir())
+    assert not out.exists()
+
+
+def test_context_materialise_accepts_safe_staging_parent(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "context.md").write_text("context\n", encoding="utf-8")
+    pack_data = compile_typed_context_data(
+        {
+            "repo_root": str(repo),
+            "items": [
+                {
+                    "item_id": "context",
+                    "context_type": "artefact",
+                    "source_path": "context.md",
+                    "delivery_mode": "copy_to_staging",
+                }
+            ],
+        }
+    )
+    pack_data["pack_hash"] = TypedContextPack.canonical_hash(pack_data)
+    pack_path = tmp_path / "pack.json"
+    pack_path.write_text(json.dumps(pack_data), encoding="utf-8")
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps({"secret_patterns": SecretPatterns().model_dump(mode="json")}),
+        encoding="utf-8",
+    )
+    staging = tmp_path / "staging"
+    out = tmp_path / "result.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "context-materialise",
+            "--pack",
+            str(pack_path),
+            "--policy",
+            str(policy_path),
+            "--repo-root",
+            str(repo),
+            "--staging-parent",
+            str(staging),
+            "--out",
+            str(out),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert out.is_file()
+    result_data = json.loads(out.read_text(encoding="utf-8"))
+    output_dir = Path(result_data["output_dir"])
+    assert (output_dir / "context.md").read_text(encoding="utf-8") == "context\n"
+
+
 def test_compile_command_writes_pack(tmp_path: Path) -> None:
     manifest, config, output = _inputs(tmp_path)
     result = CliRunner().invoke(
@@ -164,6 +276,114 @@ def test_compile_command_writes_pack(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert output.is_file()
     assert "Pack hash:" in result.stdout
+
+
+def test_typed_context_cli_mixed_preview_compile_and_materialise(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".gitignore").write_text("generated/\n", encoding="utf-8")
+    (repo / "rule.md").write_text("scoped rule", encoding="utf-8")
+    (repo / "general.md").write_text("general context", encoding="utf-8")
+    (repo / "asset.bin").write_bytes(b"opaque")
+    (repo / "shadow.md").write_text("generated instructions", encoding="utf-8")
+    Repo.init(repo)
+    manifest = tmp_path / "typed.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "repo_root": str(repo),
+                "items": [
+                    {
+                        "item_id": "rule",
+                        "context_type": "rule",
+                        "source_path": "rule.md",
+                        "scope": {"path_glob": "src/**/*.py"},
+                    },
+                    {"item_id": "general", "context_type": "general", "source_path": "general.md"},
+                    {
+                        "item_id": "asset",
+                        "context_type": "artefact",
+                        "source_path": "asset.bin",
+                        "delivery_mode": "reference_only",
+                    },
+                    {
+                        "item_id": "shadow",
+                        "context_type": "shadow_file",
+                        "source_path": "shadow.md",
+                        "shadow_file_policy": {"destination": "generated/AGENTS.md"},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"secret_patterns": {}}), encoding="utf-8")
+    runner = CliRunner()
+
+    preview = runner.invoke(
+        app,
+        [
+            "context-preview",
+            "--input",
+            str(manifest),
+            "--repo-root",
+            str(repo),
+            "--policy",
+            str(policy),
+            "--json",
+        ],
+    )
+    assert preview.exit_code == 0
+    assert '"decision": "adapter_required"' in preview.stdout
+    assert "scoped rule" in preview.stdout
+    assert "scoped rule" not in preview.stdout.replace(
+        "scoped rule requires adapter at materialisation", ""
+    )
+
+    pack_path = tmp_path / "typed-pack.json"
+    compiled = runner.invoke(
+        app,
+        [
+            "context-compile",
+            "--input",
+            str(manifest),
+            "--config",
+            str(policy),
+            "--out",
+            str(pack_path),
+            "--json",
+        ],
+    )
+    assert compiled.exit_code == 0
+    assert pack_path.is_file()
+
+    result_path = tmp_path / "materialisation.json"
+    materialised = runner.invoke(
+        app,
+        [
+            "context-materialise",
+            "--pack",
+            str(pack_path),
+            "--policy",
+            str(policy),
+            "--repo-root",
+            str(repo),
+            "--staging-parent",
+            str(tmp_path / "staging"),
+            "--out",
+            str(result_path),
+            "--json",
+        ],
+    )
+    assert materialised.exit_code == 0
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    outcomes = {item["item_id"]: item for item in result["outcomes"]}
+    assert outcomes["rule"]["status"] == "materialised"
+    assert outcomes["opencode-rules-adapter"]["status"] == "materialised"
+    assert outcomes["asset"]["status"] == "materialised"
+    assert outcomes["shadow"]["status"] == "materialised"
+    assert "scoped rule" not in result_path.read_text(encoding="utf-8")
 
 
 def test_compile_requires_manifest_out_and_config(tmp_path: Path) -> None:
