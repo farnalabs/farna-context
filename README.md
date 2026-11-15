@@ -18,6 +18,7 @@ uv sync --dev
 - `farna-context verify` - Verify integrity
 - `farna-context receipt` - Generate receipt
 - `farna-context secrets` - Scan for secrets
+- `farna-context dogfood-prepare` - Prepare an inspectable dogfood pack, materialisation receipt, and OpenCode launch manifest without launching OpenCode
 
 ## Alpha context types
 
