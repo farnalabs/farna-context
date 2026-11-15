@@ -17,15 +17,28 @@ uv run python evaluation/run_evaluation.py --fixture synthetic --dry-run --outpu
 
 The default remains five repetitions per valid arm, ten JSONL records total, with the frozen randomized assignment seed. Dry-run records include exact A/B context-delivery records and never invoke an executable. The ignored shadow file is treated as allowed runtime/context materialisation, recorded separately, and removed only when its hash matches. Dry-run records are planning records and are not task outcomes.
 
-## Execute the bounded evaluation
+## Execute the bounded real OpenCode probe (human-run only)
+
+The real probe is intentionally not run by the test suite. Run it manually with an explicit output directory and a bounded repetition count:
 
 ```bash
 uv run python evaluation/run_evaluation.py \
   --fixture synthetic \
   --opencode opencode \
   --model UNSPECIFIED \
-  --output-dir /tmp/farna-context-evaluation
+  --repetitions 1 \
+  --output-dir /tmp/farna-context-evaluation-real
 ```
+
+Use a new output directory for each probe. Do not omit `--output-dir` or raise repetitions without an explicit review of the time bound.
+
+The fake executable test is separate and deterministic:
+
+```bash
+uv run pytest tests/test_evaluation.py -q -k native_shadow
+```
+
+It validates harness delivery and classification only. It is not evidence about real OpenCode consumption or product efficacy.
 
 `--opencode` is the local OpenCode executable and `--model` is passed through only when it is not `UNSPECIFIED`; no key or credential is embedded in the harness. Each attempt gets a new temporary checkout, an in-checkout prompt and pack, isolated HOME/XDG config/cache/data directories, and process. Every OpenCode subprocess is launched with that checkout as its working directory, and the prompt names only relative paths inside it; the parent Farna Context checkout is never supplied as the project directory. The task is supplied through an explicitly opened prompt-file stdin; stdin is never inherited. Setup has a hard 10-second sentinel budget and a 10,000-file cap. Before and after each subprocess, the runner records a bounded parent sentinel: git status plus content hashes for tracked and ordinary untracked files in the parent worktree. It explicitly excludes `.agents` (including `.agents/worktrees`), `.venv`, caches, `node_modules`, generated outputs, pycache, evaluation runs and other transient names, and never follows symlinks. This detects tracked content edits, additions, deletions and unexpected untracked files in the parent product/source trees, but does not claim OS-level sandboxing or detect changes outside the declared parent boundary. Any parent change is retained as evidence, classified as `contamination_invalidity`, prevents the oracle from running, and makes the experiment inconclusive. The runner never deletes parent files. Sentinel timeout or guard errors become setup-invalidity records rather than empty attempts. Each completed attempt is flushed and fsynced to JSONL immediately, and summary.json is written in a finally path, so interruption leaves partial but diagnosable evidence; an interrupted attempt is never treated as valid. The runner enforces the protocol timeout (900 seconds by default), runs the fixed pytest oracle only after a clean provider attempt, and stores only bounded redacted output summaries and hashes. Checkout changes are split into task changes and runtime artefacts. Runtime artefacts include harness/provider state under `config/opencode`, `data/opencode`, and `home/.npm`, plus the explicit transient names `cache`, `caches`, `data`, `config`, `.evaluation-pack`, `.evaluation-output`, evaluation run/output directories, `__pycache__`, virtual environments, build/cache directories, and similar tool caches. They remain observable and are recorded in `delivery_evidence.runtime_artifacts` and the launch manifest; they are not allowed to hide an unexpected `src/**`, `tests/**`, or other task-relevant file. `changed_files` contains only non-artefact task changes, and `changed_file_scope` is true only when those changes are in the frozen task allowlist.
 
@@ -37,7 +50,7 @@ If the executable, provider, model, or authentication is unavailable, the record
 
 A valid task failure is retained and scored as a failure. Setup, provider, harness, and contamination failures are retained but excluded from the primary outcome denominator. Invalidity asymmetry above 10 percentage points, provider failure preventing comparable runs, or fewer than four valid runs per arm makes the experiment inconclusive. The exploratory thresholds are not product guarantees.
 
-Do not claim that the model consumed the generated pack from arm assignment alone. Report only the association between arm assignment and observed outcomes unless pack consumption is independently observed.
+Do not claim that a real model consumed generated context from arm assignment alone. The real OpenCode path reports native-shadow delivery and leaves consumption unobserved unless independently observed. The deterministic fake executable in `evaluation/fixtures/fake-opencode.py` is a harness contract test: its Arm B result proves that the harness materialises the shadow and that a cooperating executable can read it, not that OpenCode models consume it or that the context improves product efficacy.
 
 ## Evidence and safety
 

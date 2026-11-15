@@ -21,6 +21,7 @@ EXPECTED_THRESHOLD_POINTS = 20
 EXPECTED_OVERHEAD_RATIO = 2.0
 EXPECTED_MINIMUM_VALID_RUNS = 4
 EXPECTED_EXECUTION_RECORDS = 2
+EXPECTED_FAKE_RECORDS = 2
 
 
 def test_protocol_has_required_boundaries_and_thresholds() -> None:
@@ -122,6 +123,81 @@ def _fake_executable(tmp_path: Path, body: str) -> Path:
     executable.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
     return executable
+
+
+def test_fake_native_shadow_evaluation_is_deterministic_and_incremental(tmp_path: Path) -> None:
+    parent_status_before = subprocess.run(
+        ["git", "-C", str(ROOT), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    executable = ROOT / "evaluation" / "fixtures" / "fake-opencode.py"
+    results_path, summary_path = run_evaluation(
+        fixture=synthetic_fixture(),
+        output_dir=tmp_path / "runs",
+        repetitions=1,
+        dry_run=False,
+        model="UNSPECIFIED",
+        executable=str(executable),
+    )
+    records = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines()]
+    by_arm = {record["arm"]: record for record in records}
+    assert set(by_arm) == {"A", "B"}
+
+    arm_a = by_arm["A"]
+    assert arm_a["validity"] == "valid_task_success"
+    assert arm_a["outcome_status"] == "success"
+    assert arm_a["delivery_evidence"]["oracle_passed"] is True
+    assert arm_a["delivery_evidence"]["stdout_summary"]
+    assert '"native_shadow_consumed": false' in arm_a["delivery_evidence"]["stdout_summary"]
+
+    arm_b = by_arm["B"]
+    assert arm_b["context_delivery"]["git_ignore_preflight"]["ignored"] is True
+    assert arm_b["context_delivery"]["git_ignore_preflight"]["refused"] is False
+    assert arm_b["context_delivery"]["shadow_destination"] == ".farna-context/shadow/AGENTS.md"
+    assert arm_b["validity"] == "valid_task_success"
+    assert arm_b["outcome_status"] == "success"
+    assert arm_b["delivery_evidence"]["oracle_passed"] is True
+    assert arm_b["delivery_evidence"]["changed_files"] == [
+        "src/slugify.py",
+        "tests/test_slugify.py",
+    ]
+    assert '"native_shadow_consumed": true' in arm_b["delivery_evidence"]["stdout_summary"]
+    assert arm_b["guardrails"]["status"] == "passed"
+    assert arm_b["contamination_check"]["status"] == "passed"
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["records"] == EXPECTED_FAKE_RECORDS
+    assert summary["validity_counts"]["valid_task_success"] == EXPECTED_FAKE_RECORDS
+    stages_path = results_path.with_name("stages.jsonl")
+    stages = [
+        json.loads(line)["stage"] for line in stages_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert stages.count("shadow_materialised") == 1
+    assert stages.count("attempt_record_flushed") == EXPECTED_FAKE_RECORDS
+    assert stages.count("summary_write_complete") == 1
+    parent_status_after = subprocess.run(
+        ["git", "-C", str(ROOT), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert parent_status_after == parent_status_before
+
+
+def test_fake_native_shadow_version_probe_has_no_side_effects(tmp_path: Path) -> None:
+    executable = ROOT / "evaluation" / "fixtures" / "fake-opencode.py"
+    completed = subprocess.run(
+        [str(executable), "--version"],
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert completed.stdout.strip() == "fake-opencode-native-shadow 1.0"
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_fake_execution_closes_stdin_scores_oracle_and_isolates_arms(tmp_path: Path) -> None:
