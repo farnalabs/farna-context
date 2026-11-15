@@ -205,6 +205,11 @@ print(json.dumps({'prompt_sha256': len(prompt)}))
         json.loads(summary_path.read_text(encoding="utf-8"))["records"]
         == EXPECTED_EXECUTION_RECORDS
     )
+    stages_path = results_path.with_name("stages.jsonl")
+    stages = [json.loads(line)["stage"] for line in stages_path.read_text().splitlines()]
+    assert stages.count("shadow_materialised") == 1
+    assert stages.count("attempt_record_flushed") == EXPECTED_EXECUTION_RECORDS
+    assert stages.count("command_version_probe_complete") == EXPECTED_EXECUTION_RECORDS
 
 
 def test_unexpected_file_scope_fails_even_with_passing_oracle(tmp_path: Path) -> None:
