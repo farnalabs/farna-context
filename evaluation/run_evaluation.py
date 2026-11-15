@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -369,15 +370,17 @@ def load_protocol() -> dict[str, Any]:
     return json.loads(PROTOCOL_PATH.read_text(encoding="utf-8"))
 
 
-def parent_repository_root() -> Path | None:
+def parent_repository_root(*, timeout: float = _SETUP_BUDGET_SECONDS) -> Path | None:
     try:
         common_dir = subprocess.run(
             ["git", "-C", str(ROOT), "rev-parse", "--git-common-dir"],
             capture_output=True,
             text=True,
             check=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
         ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
     common_path = Path(common_dir)
     if not common_path.is_absolute():
@@ -390,17 +393,34 @@ def synthetic_fixture() -> Fixture:
     return Fixture("synthetic", root, root / "TASK.md")
 
 
-def copy_fixture(fixture: Fixture, destination: Path) -> None:
+def copy_fixture(
+    fixture: Fixture,
+    destination: Path,
+    *,
+    timeout: float = _SETUP_BUDGET_SECONDS,
+) -> None:
     shutil.copytree(fixture.root, destination, dirs_exist_ok=True)
-    subprocess.run(["git", "-C", str(destination), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(destination), "init", "-q"],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        timeout=timeout,
+    )
 
 
-def _git_check_ignore(checkout: Path, relative: Path) -> dict[str, Any]:
+def _git_check_ignore(
+    checkout: Path,
+    relative: Path,
+    *,
+    timeout: float = _SETUP_BUDGET_SECONDS,
+) -> dict[str, Any]:
     completed = subprocess.run(
         ["git", "-C", str(checkout), "check-ignore", "-v", "--", relative.as_posix()],
         capture_output=True,
         text=True,
         check=False,
+        stdin=subprocess.DEVNULL,
+        timeout=timeout,
     )
     return {
         "ignored": completed.returncode == 0,
@@ -409,16 +429,26 @@ def _git_check_ignore(checkout: Path, relative: Path) -> dict[str, Any]:
     }
 
 
-def _shadow_preflight(checkout: Path, destination: Path) -> dict[str, Any]:
+def _shadow_preflight(
+    checkout: Path,
+    destination: Path,
+    *,
+    timeout: float = _SETUP_BUDGET_SECONDS,
+) -> dict[str, Any]:
     relative = destination.relative_to(checkout)
-    result = _git_check_ignore(checkout, relative)
+    result = _git_check_ignore(checkout, relative, timeout=timeout)
     result["destination"] = relative.as_posix()
     result["refused"] = not result["ignored"]
     return result
 
 
-def materialise_shadow(checkout: Path, destination: Path) -> tuple[str, str, dict[str, Any]]:
-    preflight = _shadow_preflight(checkout, destination)
+def materialise_shadow(
+    checkout: Path,
+    destination: Path,
+    *,
+    timeout: float = _SETUP_BUDGET_SECONDS,
+) -> tuple[str, str, dict[str, Any]]:
+    preflight = _shadow_preflight(checkout, destination, timeout=timeout)
     if preflight["refused"]:
         raise ValueError("shadow destination is not ignored")  # noqa: TRY003
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -454,6 +484,20 @@ def assignment_order(repetitions: int) -> list[tuple[str, int]]:
     assignments = [(arm, attempt) for attempt in range(1, repetitions + 1) for arm in _VALID_ARMS]
     random.Random(ASSIGNMENT_SEED).shuffle(assignments)
     return assignments
+
+
+def _append_stage_trace(trace_path: Path, stage: str, *, detail: str | None = None) -> None:
+    event: dict[str, Any] = {
+        "stage": stage,
+        "elapsed_monotonic": round(time.monotonic(), 6),
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+    if detail is not None:
+        event["detail"] = detail
+    with trace_path.open("a", encoding="utf-8") as trace_file:
+        trace_file.write(json.dumps(event, sort_keys=True) + "\n")
+        trace_file.flush()
+        os.fsync(trace_file.fileno())
 
 
 def _bounded_summary(data: str) -> str:
@@ -648,11 +692,19 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
     pack_path: Path | None,
     command: list[str],
     timeout: int,
+    stage_trace: Callable[[str], None] | None = None,
 ) -> ExecutionResult:
+    def trace(stage: str) -> None:
+        if stage_trace is not None:
+            stage_trace(stage)
+
+    trace("attempt_snapshot_before")
+
     try:
         before = file_hashes(checkout)
     except OSError:
         return _setup_failure("checkout_snapshot_unstable")
+    trace("checkout_snapshot_before_complete")
     directory_argument = _directory_argument(command)
     directory_error = (
         "directory_argument_missing"
@@ -688,6 +740,7 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
             },
         )
     parent_root = parent_repository_root()
+    trace("parent_root_discovered")
     setup_deadline = time.monotonic() + _SETUP_BUDGET_SECONDS
     try:
         parent_before = (
@@ -699,14 +752,18 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
         return _setup_failure(
             "parent_sentinel_timeout", launch_manifest={"error": "parent_sentinel_timeout"}
         )
+    trace("parent_sentinel_before_complete")
     prompt = _prompt_for(arm, task, pack_path, checkout)
     prompt_path = checkout / ".evaluation-prompt.md"
     prompt_path.write_bytes(prompt)
+    trace("prompt_written")
     environment = _isolated_environment(checkout)
     environment["OPENCODE_PROJECT_DIR"] = str(checkout)
     environment["FARNA_CONTEXT_EVALUATION_CHECKOUT"] = str(checkout)
     command = [*command]
+    trace("command_version_probe_before")
     executable_version = command_version(command[0])
+    trace("command_version_probe_complete")
     launch_manifest = _launch_manifest(
         command=command,
         environment=environment,
@@ -720,6 +777,7 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
     provider_ok = False
     provider_failure_class: str | None = None
     try:
+        trace("attempt_process_before")
         with prompt_path.open("rb") as prompt_file:
             completed = subprocess.run(
                 command,
@@ -732,6 +790,7 @@ def execute_attempt(  # noqa: PLR0913, PLR0915
             )
         output = completed.stdout
         error = completed.stderr
+        trace("attempt_process_complete")
         returncode = completed.returncode
         provider_ok = returncode == 0
         if not provider_ok:
@@ -825,7 +884,6 @@ def build_record(  # noqa: PLR0913
     shadow_preflight: dict[str, Any] | None,
     dry_run: bool,
     model: str,
-    executable: str,
     protocol: dict[str, Any],
     execution: ExecutionResult | None,
 ) -> dict[str, Any]:
@@ -879,7 +937,13 @@ def build_record(  # noqa: PLR0913
         "model_version": model,
         "tool_versions": {
             "python": sys.version.split()[0],
-            "opencode": "not_run" if dry_run else command_version(executable),
+            "opencode": (
+                "not_run"
+                if dry_run
+                else execution.launch_manifest.get("executable_version", "unobserved")
+                if execution
+                else "unobserved"
+            ),
         },
         "permission_policy": protocol["isolation"]["permission_policy"],
         "network_policy": protocol["isolation"]["network_policy"],
@@ -981,6 +1045,12 @@ def run_evaluation(  # noqa: PLR0913
     result_path = experiment_dir / "results.jsonl"
     records: list[dict[str, Any]] = []
     task_id = protocol["frozen_inputs"]["task_id"]
+    trace_path = experiment_dir / "stages.jsonl"
+
+    def trace(stage: str, *, detail: str | None = None) -> None:
+        _append_stage_trace(trace_path, stage, detail=detail)
+
+    trace("experiment_directory_created", detail=str(experiment_dir))
     try:
         with result_path.open("w", encoding="utf-8") as result_file:
             for assignment_index, (arm, attempt) in enumerate(
@@ -991,16 +1061,21 @@ def run_evaluation(  # noqa: PLR0913
                 ) as temporary:
                     temporary_path = Path(temporary)
                     checkout = temporary_path / "checkout"
+                    trace("temporary_checkout_directory_created", detail=str(temporary_path))
                     copy_fixture(fixture, checkout)
+                    trace("fixture_copied", detail=str(checkout))
+                    trace("temp_checkout_setup_complete")
                     pack_hash: str | None = None
                     post_pack_hash: str | None = None
                     pack_path: Path | None = None
                     shadow_preflight: dict[str, Any] | None = None
                     if arm == "B":
                         pack_path = checkout / _SHADOW_DESTINATION
+                        trace("shadow_preflight_before")
                         pack_hash, post_pack_hash, shadow_preflight = materialise_shadow(
                             checkout, pack_path
                         )
+                        trace("shadow_materialised", detail=pack_path.as_posix())
                     command = [
                         executable,
                         "run",
@@ -1012,6 +1087,7 @@ def run_evaluation(  # noqa: PLR0913
                     ]
                     if model != "UNSPECIFIED":
                         command.extend(["--model", model])
+                    trace("attempt_record_setup_complete")
                     execution = (
                         None
                         if dry_run
@@ -1022,6 +1098,7 @@ def run_evaluation(  # noqa: PLR0913
                             pack_path=pack_path,
                             command=command,
                             timeout=int(protocol["runner"]["timeout_seconds"]),
+                            stage_trace=trace,
                         )
                     )
                     record = build_record(
@@ -1037,15 +1114,17 @@ def run_evaluation(  # noqa: PLR0913
                         shadow_preflight=shadow_preflight,
                         dry_run=dry_run,
                         model=model,
-                        executable=executable,
                         protocol=protocol,
                         execution=execution,
                     )
                     records.append(record)
+                    trace("attempt_record_created")
                     result_file.write(json.dumps(record, sort_keys=True) + "\n")
                     result_file.flush()
                     os.fsync(result_file.fileno())
+                    trace("attempt_record_flushed")
     finally:
+        trace("summary_write_before")
         _write_summary(
             experiment_dir=experiment_dir,
             result_path=result_path,
@@ -1057,6 +1136,7 @@ def run_evaluation(  # noqa: PLR0913
             task_id=task_id,
             records=records,
         )
+        trace("summary_write_complete")
     summary_path = experiment_dir / "summary.json"
     return result_path, summary_path
 
