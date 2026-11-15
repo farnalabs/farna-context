@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import shlex
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -35,11 +37,11 @@ def _sha256(path: Path) -> str:
 
 
 def _regular_file(path: Path, label: str) -> Path:
-    resolved = path.expanduser().resolve(strict=True)
-    reject_reparse_components(resolved)
-    if not resolved.is_file():
+    candidate = path.expanduser()
+    reject_reparse_components(candidate)
+    if not candidate.is_file() or not stat.S_ISREG(candidate.stat().st_mode):
         raise ValueError(f"{label} is not a regular file: {path}")  # noqa: TRY003
-    return resolved
+    return candidate
 
 
 def _private_files(values: str | None) -> list[Path]:
@@ -49,28 +51,36 @@ def _private_files(values: str | None) -> list[Path]:
     for raw in values.split(os.pathsep):
         if not raw.strip():
             continue
-        path = Path(raw).expanduser().resolve(strict=True)
+        path = Path(raw).expanduser()
         reject_reparse_components(path)
         if path.is_file():
-            result.append(path)
+            result.append(_regular_file(path, "Private context"))
         elif path.is_dir():
-            result.extend(
-                child
-                for child in sorted(path.rglob("*"))
-                if child.is_file() and ".git" not in child.parts
-            )
+            for current_root, directories, filenames in os.walk(path, followlinks=False):
+                current = Path(current_root)
+                safe_directories: list[str] = []
+                for name in directories:
+                    directory = current / name
+                    reject_reparse_components(directory)
+                    safe_directories.append(name)
+                directories[:] = safe_directories
+                for name in sorted(filenames):
+                    child = current / name
+                    if ".git" not in child.parts:
+                        result.append(_regular_file(child, "Private context"))
         else:
             raise ValueError(f"Private context path is not a file or directory: {raw}")  # noqa: TRY003
     return result
 
 
 def _repo_context_files(repo_root: Path) -> list[Path]:
-    files = {
-        path
-        for name in ("AGENTS.md", "CLAUDE.md")
-        for path in repo_root.rglob(name)
-        if path.is_file() and ".git" not in path.parts
-    }
+    files: list[Path] = []
+    for current_root, directories, filenames in os.walk(repo_root, followlinks=False):
+        directories[:] = [name for name in directories if name != ".git"]
+        current = Path(current_root)
+        for name in ("AGENTS.md", "CLAUDE.md"):
+            if name in filenames:
+                files.append(_regular_file(current / name, "Repository guidance"))
     return sorted(files)
 
 
@@ -152,8 +162,9 @@ def prepare_dogfood(  # noqa: PLR0913
         raise ValueError("Dogfood preparation currently supports only --harness opencode")  # noqa: TRY003
     if not profile.strip():
         raise ValueError("Profile must not be empty")  # noqa: TRY003
-    root = repo_root.expanduser().resolve(strict=True)
-    reject_reparse_components(root)
+    root_candidate = repo_root.expanduser()
+    reject_reparse_components(root_candidate)
+    root = root_candidate.resolve(strict=True)
     if not root.is_dir():
         raise ValueError("Repository root is not a directory")  # noqa: TRY003
     output = out.expanduser().resolve()
@@ -183,9 +194,10 @@ def prepare_dogfood(  # noqa: PLR0913
     general_path = operation_dir / "general-context.md"
     general_path.write_text(str(materialisation.get("general_context", "")), encoding="utf-8")
     launch_command = (
-        f"cd {root} && FARNA_CONTEXT_MATERIALISATION={operation_dir} "
-        "opencode run --command improve-docs -- --mode internal --path docs "
-        "--max-files 12 < /dev/null"
+        f"cd {shlex.quote(str(root))} && "
+        f"FARNA_CONTEXT_MATERIALISATION={shlex.quote(str(operation_dir))} "
+        "opencode run --command improve-docs -- --mode internal --path "
+        f"{shlex.quote('docs')} --max-files 12 < /dev/null"
     )
     launch_path = output / "launch.json"
     launch = {
